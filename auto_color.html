@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Hue XY Builder</title>
+<style>
+body { font-family: monospace; padding:20px }
+canvas { border:1px solid black; cursor: crosshair }
+</style>
+</head>
+<body>
+
+<h3>Hue XY Picker</h3>
+
+<canvas id="xy" width="300" height="300"></canvas>
+<br><br>
+
+Brightness:
+<input type="range" id="brightness" min="1" max="254" value="254">
+<span id="bval">254</span>
+
+<br><br>
+
+<textarea id="output" rows="4" cols="90"></textarea>
+<br><br>
+<button onclick="copyToClipboard()">Copy DATA</button>
+<span id="copyStatus"></span>
+
+<br><br>
+
+<button onclick="applyPreset('energize')">Energize</button>
+<button onclick="applyPreset('read')">Read</button>
+<button onclick="applyPreset('santorini')">Santorini</button>
+
+
+
+
+<script>
+const canvas = document.getElementById("xy");
+const ctx = canvas.getContext("2d");
+const brightnessSlider = document.getElementById("brightness");
+const output = document.getElementById("output");
+const bval = document.getElementById("bval");
+
+
+const PRESETS = {
+    energize: [
+        0x01,0x01,0x01,0x02,0x01,0xFE,0x03,0x02,0x9C,0x00
+    ],
+    read: [
+        0x01,0x01,0x01,0x02,0x01,0xFE,0x03,0x02,0x5a,0x01
+    ],
+    santorini: [
+        0x01,0x01,0x01,0x02,0x01,0xCA,0x04,0x04,
+        0x77,0x77,0x37,0x4B,0x07,0x13,0x50,0x00,
+        0x00,0x00,0x4F,0x15,0x54,0x61,0x97,0x6A,
+        0xE4,0x87,0x70,0x9F,0x88,0x73,0x29,0x3A,
+        0x59,0x08,0x01,0xA0
+    ]
+};
+
+
+
+
+let currentX = 32768;
+let currentY = 32768;
+
+// Draw XY gradient
+for(let x=0; x<300; x++){
+    for(let y=0; y<300; y++){
+        ctx.fillStyle = `rgb(${x}, ${y}, ${255-y})`;
+        ctx.fillRect(x,y,1,1);
+    }
+}
+
+function buildPacket(x16, y16, brightness){
+    return [
+        0x01,0x01,0x01,0x02,0x01,brightness,
+        0x04,0x04,
+        x16 & 0xFF, (x16 >> 8) & 0xFF,
+        y16 & 0xFF, (y16 >> 8) & 0xFF,
+    ];
+}
+
+function updatePacket(){
+    const brightness = parseInt(brightnessSlider.value);
+    bval.textContent = brightness;
+
+    const data = buildPacket(currentX, currentY, brightness);
+
+    // Convert to hex string
+    const hexString = data.map(b =>
+        b.toString(16).padStart(2,"0")
+    ).join("");
+
+    // Auto send to python server
+    //fetch(`http://localhost:8000/send?data=${hexString}`)
+    //    .then(()=>console.log("Sent to BLE"));
+
+    //output.value = hexString;
+    sendToPython(data);
+
+}
+
+function applyPreset(name) {
+    const brightness = parseInt(brightnessSlider.value);
+    bval.textContent = brightness;
+
+    // Clone preset
+    const data = [...PRESETS[name]];
+
+    // Replace brightness byte (index 5)
+    data[5] = brightness;
+
+    sendToPython(data);
+}
+
+function sendToPython(data) {
+    const hexString = data.map(b =>
+        b.toString(16).padStart(2,"0")
+    ).join("");
+
+    fetch(`http://localhost:8000/send?data=${hexString}`)
+        .then(()=>console.log("Sent to BLE"));
+
+    output.value = hexString;
+}
+
+
+brightnessSlider.addEventListener("input", updatePacket);
+
+// Canvas click updates XY AND rebuilds packet
+canvas.addEventListener("click", e=>{
+    const rect = canvas.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const py = e.clientY - rect.top;
+
+    currentX = Math.floor((px/300) * 65535);
+    currentY = Math.floor((py/300) * 65535);
+
+    updatePacket();
+});
+
+function copyToClipboard(){
+    const text = document.getElementById("output").value;
+
+    navigator.clipboard.writeText(text).then(()=>{
+        document.getElementById("copyStatus").textContent = " ✔ Copied!";
+        setTimeout(()=>{
+            document.getElementById("copyStatus").textContent = "";
+        },1000);
+    });
+}
+
+
+// Initialize once
+updatePacket();
+</script>
+
+
+
+
+
+
+
+
+
+</body>
+</html>
+
