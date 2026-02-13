@@ -12,6 +12,7 @@ from bleak import BleakClient, BleakScanner
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
+import webbrowser
 
 
 #LIGHT_NAME = "Hue lightstrip"
@@ -127,34 +128,7 @@ class HueLight:
         log.info("Done.")
 
 
-def start_customize_server(light: HueLight):
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            parsed = urlparse(self.path)
 
-            if parsed.path == "/send":
-                qs = parse_qs(parsed.query)
-
-                if "data" in qs:
-                    hex_string = qs["data"][0]
-                    data_bytes = bytes.fromhex(hex_string)
-
-                    asyncio.create_task(
-                        light.client.write_gatt_char(
-                            COLOR_UUID, data_bytes, response=False
-                        )
-                    )
-
-                    self.send_response(200)
-                    self.end_headers()
-                    self.wfile.write(b"OK")
-                    return
-
-            self.send_response(404)
-            self.end_headers()
-
-    print("Customize server running at http://localhost:8000")
-    HTTPServer(("localhost", 8000), Handler).serve_forever()
 
 
 
@@ -210,11 +184,51 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 
-def start_customize_server(loop: asyncio.AbstractEventLoop, queue: "asyncio.Queue[bytes]"):
+
+def start_customize_server(loop: asyncio.AbstractEventLoop, queue: "asyncio.Queue[bytes]", light:HueLight):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urlparse(self.path)
 
+            # Serve HTML
+            if parsed.path == "/" or parsed.path == "":
+                self.send_response(200)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+
+                with open("auto_color.html", "rb") as f:
+                    self.wfile.write(f.read())
+                return
+
+
+            # Handle power control
+            if parsed.path == "/power":
+                qs = parse_qs(parsed.query)
+                if "state" in qs:
+                    state = qs["state"][0]
+            
+                    if state == "on":
+                        # default ON brightness
+                        loop.call_soon_threadsafe(
+                            asyncio.create_task,
+                            light.set_power(True, 0xFE)
+                        )
+                    elif state == "off":
+                        loop.call_soon_threadsafe(
+                            asyncio.create_task,
+                            light.set_power(False, None)
+                        )
+            
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"OK")
+                    return
+
+
+
+
+
+            # Handle color send
             if parsed.path == "/send":
                 qs = parse_qs(parsed.query)
                 if "data" in qs:
@@ -227,7 +241,6 @@ def start_customize_server(loop: asyncio.AbstractEventLoop, queue: "asyncio.Queu
                         self.wfile.write(b"Bad hex")
                         return
 
-                    # Enqueue safely into the asyncio loop thread
                     loop.call_soon_threadsafe(queue.put_nowait, data_bytes)
 
                     self.send_response(200)
@@ -240,7 +253,6 @@ def start_customize_server(loop: asyncio.AbstractEventLoop, queue: "asyncio.Queu
 
     print("Customize server running at http://localhost:8000")
     HTTPServer(("localhost", 8000), Handler).serve_forever()
-
 
 
 async def ble_writer(light: "HueLight", queue: "asyncio.Queue[bytes]") -> None:
@@ -272,7 +284,7 @@ async def run(args: argparse.Namespace) -> None:
         writer_task = asyncio.create_task(ble_writer(light, queue))
 
         # Start blocking HTTP server in a thread
-        t = threading.Thread(target=start_customize_server, args=(loop, queue), daemon=True)
+        t = threading.Thread(target=start_customize_server, args=(loop, queue, light), daemon=True)
         t.start()
 
         # Keep main asyncio task alive forever (until Ctrl+C)
@@ -284,12 +296,12 @@ async def run(args: argparse.Namespace) -> None:
 
     
 
-    if hasattr(args, "color") and args.color:
-        brightness, red, green, blue = PRESET_COLORS[args.color]
-        await light.set_rgb(brightness, red, green, blue)
-        #payload = PRESET_PAYLOADS[args.color]
-        #await light.set_color_payload(ColorPayload(payload, note=f"preset {args.color}"))
-        return
+    #if hasattr(args, "color") and args.color:
+    #    brightness, red, green, blue = PRESET_COLORS[args.color]
+    #    await light.set_rgb(brightness, red, green, blue)
+    #    #payload = PRESET_PAYLOADS[args.color]
+    #    #await light.set_color_payload(ColorPayload(payload, note=f"preset {args.color}"))
+    #    return
 
 
     try:

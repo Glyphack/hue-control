@@ -19,12 +19,7 @@ Brightness:
 <input type="range" id="brightness" min="1" max="254" value="254">
 <span id="bval">254</span>
 
-<br><br>
 
-<textarea id="output" rows="4" cols="90"></textarea>
-<br><br>
-<button onclick="copyToClipboard()">Copy DATA</button>
-<span id="copyStatus"></span>
 
 <br><br>
 
@@ -32,6 +27,15 @@ Brightness:
 <button onclick="applyPreset('read')">Read</button>
 <button onclick="applyPreset('santorini')">Santorini</button>
 
+<br><br>
+<button onclick="sendPower(false)">Power OFF</button>
+
+<br><br>
+
+<textarea id="output" rows="4" cols="90"></textarea>
+<br><br>
+<button onclick="copyToClipboard()">Copy DATA</button>
+<span id="copyStatus"></span>
 
 
 
@@ -151,6 +155,13 @@ function copyToClipboard(){
         },1000);
     });
 }
+
+
+function sendPower(state) {
+    fetch(`http://localhost:8000/power?state=${state ? "on" : "off"}`)
+        .then(()=>console.log("Power command sent"));
+}
+
 
 
 // Initialize once
