@@ -11,13 +11,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from bleak import BleakClient, BleakScanner
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-import webbrowser
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
 
 from scripts.set_characteristic import set_characteristic
 from scripts.subscribe_all import subscribe_all
@@ -252,7 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def start_customize_server(
-    loop: asyncio.AbstractEventLoop, queue: "asyncio.Queue[bytes]", light: HueLight
+    loop: asyncio.AbstractEventLoop, queue: asyncio.Queue[bytes], light: HueLight
 ):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -312,7 +305,7 @@ def start_customize_server(
     HTTPServer(("localhost", 8000), Handler).serve_forever()
 
 
-async def ble_writer(light: "HueLight", queue: "asyncio.Queue[bytes]") -> None:
+async def ble_writer(light: HueLight, queue: asyncio.Queue[bytes]) -> None:
     while True:
         data = await queue.get()
         try:
