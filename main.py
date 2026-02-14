@@ -1,25 +1,35 @@
 """Simple BLE controller for Hue lightstrip plus."""
 
 from __future__ import annotations
+from datetime import datetime
+
 
 import argparse
 import asyncio
+from enum import StrEnum
+import enum
 import logging
+import os
 import threading
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from bleak import BleakClient, BleakScanner
 
+from scripts.delete_alarms import delete_alarms
+from scripts.read_alarms import read_alarms
 from scripts.set_characteristic import set_characteristic
 from scripts.subscribe_all import subscribe_all
 
-DEFAULT_DEVICE_NAME = "Hue lightstrip"
+DEFAULT_DEVICE_NAME = "Hue lightstrip plus"
 POWER_UUID = "932c32bd-0002-47a2-835a-a8d455b859dd"
 COLOR_UUID = "932c32bd-0007-47a2-835a-a8d455b859dd"
 RGB_UUID = "932c32bd-0005-47a2-835a-a8d455b859dd"
+TIMER_UUID = "9da2ddf1-0001-44d0-909c-3f3d3cb34a7b"
 DEFAULT_BRIGHTNESS = 0xFE
+TIME_FORMAT = "%Y-%m-%d %H:%M"
 
 
 logging.basicConfig(
@@ -35,12 +45,19 @@ class Config:
     timeout: float
 
 
+class WakeUpMode(StrEnum):
+    sunrise = enum.auto()
+    full_bright = enum.auto()
+
+
 @dataclass(frozen=True)
 class WakeupCommand:
-    time: str
-    mode: str
+    name: str
+    time: datetime
+    mode: WakeUpMode
     fade_in: int
     active: bool
+    edit: bool
 
 
 @dataclass(frozen=True)
@@ -109,13 +126,26 @@ class HueLight:
 
     async def _write(self, uuid: str, data: bytes, note: str | None = None) -> None:
         suffix = f" ({note})" if note else ""
-        log.info("WRITE uuid=%s response=False data=0x%s%s", uuid, data.hex(), suffix)
+        formatted_hex = " ".join(data.hex()[i : i + 2] for i in range(0, len(data.hex()), 2))
+        log.info("WRITE uuid=%s response=False data=0x%s%s", uuid, formatted_hex, suffix)
         await self.client.write_gatt_char(uuid, data, response=False)
-        log.info("Done.")
+        log.info("WRITE Complete")
+
+    async def set_alarm(self, data: bytes, note: str | None = None) -> None:
+        suffix = f" ({note})" if note else ""
+        formatted_hex = " ".join(data.hex()[i : i + 4] for i in range(0, len(data.hex()), 4))
+        log.info(
+            "WRITE uuid=%s response=False data=0x%s%s",
+            TIMER_UUID,
+            data.hex(),
+            suffix,
+        )
+        log.info("      formatted: %s", formatted_hex)
+        # await self.client.write_gatt_char(TIMER_UUID, data, response=False)
 
 
 def parse_hex_payload(value: str) -> bytes:
-    cleaned = value.lower().replace("0x", "").replace(" ", "")
+    cleaned = value.lower().replace("0x", "").replace(" ", "").replace("\n", "")
     if len(cleaned) % 2:
         raise SystemExit("Hex payload must have an even number of characters.")
     try:
@@ -130,8 +160,54 @@ def require_int_range(name: str, value: int, min_value: int, max_value: int) -> 
     return value
 
 
-def build_wakeup_payload(command: WakeupCommand) -> None:
-    pass
+import struct
+
+
+def datetime_to_hex_little_endian(dt):
+    """
+    Convert a datetime object to 32-bit Unix timestamp in little endian hex format.
+
+    Args:
+        dt: datetime object
+
+    Returns:
+        String in format like "D8B6 8E69"
+    """
+    timestamp = int(dt.timestamp())
+    packed = struct.pack("<I", timestamp)
+    hex_string = packed.hex().upper()
+    formatted = f"{hex_string[0:4]} {hex_string[4:8]}"
+
+    return formatted
+
+
+def encode_string(text):
+    length = len(text)
+    length_hex = format(length, "02x")
+    text_hex = text.encode("ascii").hex()
+
+    return length_hex + text_hex
+
+
+def build_wakeup_payload(command: WakeupCommand) -> bytes:
+    if command.mode == WakeUpMode.sunrise:
+        print(command.time)
+        t = datetime_to_hex_little_endian(command.time)
+        print(t)
+        n = encode_string(command.name)
+        e = "0100" if command.active else "0000"
+        print(command.edit)
+        c = "0000" if command.edit else "FF00"
+        return parse_hex_payload(
+            f"""
+            01FF {c} {e} {t} 0009
+            0101 0106 0109 0801 5B19 0194
+            D184 84B7 5143 DAA8 67A9 2F02
+            110C 8D00 FFFF FFFF {n} 01
+            """
+        )
+
+    raise AssertionError()
 
 
 def build_timer_payload(command: TimerCommand) -> None:
@@ -142,7 +218,7 @@ def build_sleep_payload(command: SleepCommand) -> None:
     pass
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_args() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Control Hue lightstrip over BLE.")
     parser.add_argument(
         "-d",
@@ -150,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_DEVICE_NAME,
         help="BLE device name.",
     )
-    parser.add_argument("--timeout", type=float, default=20.0, help="BLE scan timeout.")
+    parser.add_argument("--timeout", type=float, default=15.0, help="BLE scan timeout.")
 
     subparsers = parser.add_subparsers(dest="command")  # , required=True)
 
@@ -174,7 +250,8 @@ def build_parser() -> argparse.ArgumentParser:
     rgb.add_argument("--blue", type=int, default=0)
 
     wakeup = subparsers.add_parser("wakeup", help="Create a wakeup command.")
-    wakeup.add_argument("--time", required=True, help="Human-readable wakeup time.")
+    wakeup.add_argument("--name", required=True, help="Name of the alarm")
+    wakeup.add_argument("--time", required=True, help=f"wakeup time in format {TIME_FORMAT}")
     wakeup.add_argument(
         "--mode",
         choices=["sunrise", "fullbright"],
@@ -185,18 +262,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--fade-in",
         dest="fade_in",
         type=int,
-        choices=[10, 20, 30],
-        required=True,
+        choices=[30],
+        default=30,
         help="Fade-in time in minutes.",
+    )
+    wakeup.add_argument(
+        "--edit",
+        action="store_true",
+        help="Edit this timer instead of creating it",
+        default=False,
     )
     wakeup.add_argument(
         "--deactive",
         action="store_true",
         help="Create as inactive.",
+        default=False,
     )
 
     timer = subparsers.add_parser("timer", help="Create a timer command.")
-    timer.add_argument("--duration", required=True, help="Timer duration.")
+    timer.add_argument("--duration", required=True, help="Timer duration in seconds")
     timer.add_argument(
         "--effect",
         choices=["flash", "on", "off"],
@@ -210,7 +294,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sleep = subparsers.add_parser("sleep", help="Create a sleep command.")
-    sleep.add_argument("--time", required=True, help="Human-readable sleep time.")
+    sleep.add_argument("--time", required=True, help=f"wakeup time in format {TIME_FORMAT}")
     sleep.add_argument("--mode", help="Sleep mode.")
     sleep.add_argument(
         "--deactive",
@@ -241,12 +325,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Subscribe to all notifiable characteristics.",
     )
 
+    dev_subparsers.add_parser(
+        "read-alarms",
+        help="Read and dump all alarm slots from the lamp.",
+    )
+
+    dev_subparsers.add_parser(
+        "delete-alarms",
+        help="Delete all alarm slots from the lamp.",
+    )
+
     return parser
 
 
-def start_customize_server(
-    loop: asyncio.AbstractEventLoop, queue: asyncio.Queue[bytes], light: HueLight
-):
+def run_customize_mode(config: Config) -> None:
+    """Run customize mode with HTTP server directly calling BLE functions."""
+
+    async def connect_light():
+        return await HueLight.connect(config)
+
+    # Connect to light once at startup
+    light = asyncio.run(connect_light())
+    log.info("Connected to light for customize mode")
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -267,11 +368,16 @@ def start_customize_server(
                 if "state" in qs:
                     state = qs["state"][0]
 
-                    if state == "on":
-                        # default ON brightness
-                        loop.call_soon_threadsafe(asyncio.create_task, light.set_power(True, 0xFE))
-                    elif state == "off":
-                        loop.call_soon_threadsafe(asyncio.create_task, light.set_power(False, None))
+                    async def set_power_async():
+                        if state == "on":
+                            await light.set_power(True, 0xFE)
+                        elif state == "off":
+                            await light.set_power(False, None)
+
+                    try:
+                        asyncio.run(set_power_async())
+                    except Exception:
+                        log.exception("Power control failed")
 
                     self.send_response(200)
                     self.end_headers()
@@ -291,7 +397,14 @@ def start_customize_server(
                         self.wfile.write(b"Bad hex")
                         return
 
-                    loop.call_soon_threadsafe(queue.put_nowait, data_bytes)
+                    async def write_color_async():
+                        await light.client.write_gatt_char(COLOR_UUID, data_bytes, response=False)
+                        log.info("HTTP->BLE write: 0x%s", data_bytes.hex())
+
+                    try:
+                        asyncio.run(write_color_async())
+                    except Exception:
+                        log.exception("BLE write failed")
 
                     self.send_response(200)
                     self.end_headers()
@@ -301,25 +414,22 @@ def start_customize_server(
             self.send_response(404)
             self.end_headers()
 
+    # Open browser after short delay
+    threading.Thread(
+        target=lambda: (time.sleep(0.02), os.system("open http://localhost:8000")),
+        daemon=True,
+    ).start()
+
     print("Customize server running at http://localhost:8000")
-    HTTPServer(("localhost", 8000), Handler).serve_forever()
-
-
-async def ble_writer(light: HueLight, queue: asyncio.Queue[bytes]) -> None:
-    while True:
-        data = await queue.get()
-        try:
-            await light.client.write_gatt_char(COLOR_UUID, data, response=False)
-            log.info("HTTP->BLE write: 0x%s", data.hex())
-        except Exception:
-            log.exception("BLE write failed")
-        finally:
-            queue.task_done()
+    try:
+        HTTPServer(("localhost", 8000), Handler).serve_forever()
+    finally:
+        asyncio.run(light.disconnect())
 
 
 async def run(args: argparse.Namespace, config: Config) -> None:
+    light = await HueLight.connect(config)
     if args.command == "power":
-        light = await HueLight.connect(config)
         try:
             brightness = None
             if args.state == "on" and args.brightness is not None:
@@ -331,12 +441,14 @@ async def run(args: argparse.Namespace, config: Config) -> None:
 
     if args.command == "wakeup":
         command = WakeupCommand(
-            time=args.time,
-            mode=args.mode,
+            name=args.name,
+            time=datetime.strptime(args.time, TIME_FORMAT),
+            mode=WakeUpMode(args.mode),
             fade_in=args.fade_in,
             active=not args.deactive,
+            edit=args.edit,
         )
-        build_wakeup_payload(command)
+        await light.set_alarm(build_wakeup_payload(command))
         return
 
     if args.command == "timer":
@@ -357,27 +469,6 @@ async def run(args: argparse.Namespace, config: Config) -> None:
         build_sleep_payload(command)
         return
 
-    if args.customize:
-        light = await HueLight.connect(config)
-        print("Customize mode enabled.")
-
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[bytes] = asyncio.Queue()
-
-        # Start async BLE writer
-        writer_task = asyncio.create_task(ble_writer(light, queue))
-
-        # Start blocking HTTP server in a thread
-        t = threading.Thread(target=start_customize_server, args=(loop, queue, light), daemon=True)
-        t.start()
-
-        # Keep main asyncio task alive forever (until Ctrl+C)
-        try:
-            await asyncio.Event().wait()
-        finally:
-            writer_task.cancel()
-        return
-
     if args.command == "dev":
         if args.dev_command == "set-characteristic":
             payload = parse_hex_payload(args.data)
@@ -393,12 +484,30 @@ async def run(args: argparse.Namespace, config: Config) -> None:
             await subscribe_all(config.device_name, timeout=config.timeout)
             return
 
+        if args.dev_command == "read-alarms":
+            await read_alarms(config.device_name, timeout=config.timeout)
+            return
+
+        if args.dev_command == "delete-alarms":
+            await delete_alarms(config.device_name, timeout=config.timeout)
+            return
+
 
 def main() -> None:
-    parser = build_parser()
+    parser = build_args()
     args = parser.parse_args()
     config = Config(device_name=args.device, timeout=args.timeout)
     log.info("Using device '%s'", config.device_name)
+
+    # Handle customize mode separately (not in async context)
+    if args.customize:
+        print("Customize mode enabled.")
+        try:
+            run_customize_mode(config)
+        except KeyboardInterrupt:
+            log.info("Interrupted.")
+        return
+
     try:
         asyncio.run(run(args, config))
     except KeyboardInterrupt:
