@@ -27,3 +27,4 @@ Factory reset the lamp, then pair it using Bluetooth.
 
 - macOS: pair from Bluetooth settings.
 - Linux: pair with `bluetoothctl`.
+Macos I just reset factory the light and then opened blendr and read rgb value I prompted a page to connect to it.

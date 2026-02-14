@@ -5,25 +5,28 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass
-from typing import Optional
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from bleak import BleakClient, BleakScanner
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 import webbrowser
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
 
+from scripts.set_characteristic import set_characteristic
+from scripts.subscribe_all import subscribe_all
 
-#LIGHT_NAME = "Hue lightstrip"
-LIGHT_NAME = "3"
+DEFAULT_DEVICE_NAME = "Hue lightstrip"
 POWER_UUID = "932c32bd-0002-47a2-835a-a8d455b859dd"
 COLOR_UUID = "932c32bd-0007-47a2-835a-a8d455b859dd"
 RGB_UUID = "932c32bd-0005-47a2-835a-a8d455b859dd"
-
-DEFAULT_COLOR_PREFIX = bytes([0x01, 0x01, 0x01, 0x02, 0x01])
 DEFAULT_BRIGHTNESS = 0xFE
-DEFAULT_TEMPERATURE = 0x015A
 
 
 logging.basicConfig(
@@ -32,49 +35,33 @@ logging.basicConfig(
 )
 log = logging.getLogger("hue-control")
 
-PRESET_COLORS = {
-    "honolulu": (137, 146, 212, 91),
-    "red": (254, 255, 0, 0),
-    "green": (254, 0, 255, 0),
-    "blue": (254, 0, 0, 255),
-    "white": (254, 255, 255, 255),
-}
-PRESET_PAYLOADS = {
-    # prefix + bri + r + g + b + temp(2 bytes, little endian)
-    "honolulu": bytes([0x01, 0x01, 0x01, 0x02, 0x01, 0x5C, 0x04, 0xBB, 0x73, 0x74, 0x74]),
-}
 
+@dataclass(frozen=True)
+class Config:
+    device_name: str
+    timeout: float
 
 
 @dataclass(frozen=True)
-class HueColor:
-    brightness: int
-    red: int
-    green: int
-    blue: int
-    temperature: int
-    prefix: bytes = DEFAULT_COLOR_PREFIX
-
-    def to_bytes(self) -> bytes:
-        temp_bytes = self.temperature.to_bytes(2, "little")
-        return self.prefix + bytes([self.brightness, self.red, self.green, self.blue]) + temp_bytes
-
-    def description(self) -> str:
-        return (
-            "bri={brightness} rgb=({red},{green},{blue}) temp={temperature}"
-        ).format(
-            brightness=self.brightness,
-            red=self.red,
-            green=self.green,
-            blue=self.blue,
-            temperature=self.temperature,
-        )
+class WakeupCommand:
+    time: str
+    mode: str
+    fade_in: int
+    active: bool
 
 
 @dataclass(frozen=True)
-class ColorPayload:
-    data: bytes
-    note: str
+class TimerCommand:
+    duration: str
+    effect: str
+    active: bool
+
+
+@dataclass(frozen=True)
+class SleepCommand:
+    time: str
+    mode: str | None
+    active: bool
 
 
 @dataclass
@@ -84,52 +71,54 @@ class HueLight:
     address: str
 
     @classmethod
-    async def connect(cls, name: str, timeout: float) -> "HueLight":
-        log.info("Scanning for '%s'...", name)
-        device = await BleakScanner.find_device_by_name(name, timeout=timeout)
+    async def connect(cls, config: Config) -> HueLight:
+        log.info("Scanning for '%s'...", config.device_name)
+        device = await BleakScanner.find_device_by_name(config.device_name, timeout=config.timeout)
         if not device:
-            raise SystemExit(f"Device '{name}' not found.")
+            raise SystemExit(f"Device '{config.device_name}' not found.")
 
         log.info("Found device: %s (%s)", device.name, device.address)
-        client = BleakClient(device, timeout=timeout)
-        await client.connect(timeout=timeout)
+        client = BleakClient(device, timeout=config.timeout)
+        await client.connect(timeout=config.timeout)
         log.info("Connected=%s", client.is_connected)
-        return cls(client=client, name=device.name or name, address=device.address)
+        return cls(
+            client=client,
+            name=device.name or config.device_name,
+            address=device.address,
+        )
 
     async def disconnect(self) -> None:
         if self.client.is_connected:
             await self.client.disconnect()
 
-    async def set_power(self, on: bool, brightness: Optional[int]) -> None:
-        if on:
-            value = bytes([brightness if brightness is not None else 0x01])
-        else:
-            value = bytes([0x00])
+    async def read_power(self) -> bytes:
+        readback = await self.client.read_gatt_char(POWER_UUID)
+        readback_bytes = bytes(readback)
+        log.info("READ uuid=%s data=0x%s", POWER_UUID, readback_bytes.hex())
+        return readback_bytes
+
+    async def _confirm_power(self, target_on: bool, value: bytes) -> None:
+        target_label = "on" if target_on else "off"
+        for _attempt in range(20):
+            readback = await self.read_power()
+            if readback:
+                state_on = readback[0] != 0x00
+                if state_on == target_on:
+                    return
+            log.warning("Power not set yet (%s), retrying in 0.3s...", target_label)
+            await asyncio.sleep(0.3)
+        log.error("Failed to confirm power %s after 20 attempts", target_label)
+
+    async def set_power(self, on: bool, brightness: int | None) -> None:
+        value = bytes([brightness if brightness is not None else 0x01]) if on else bytes([0x00])
         await self._write(POWER_UUID, value, note="power")
+        await self._confirm_power(on, value)
 
-    async def set_color(self, color: HueColor) -> None:
-        await self._write(COLOR_UUID, color.to_bytes(), note=color.description())
-
-    async def set_color_payload(self, payload: ColorPayload) -> None:
-        await self._write(COLOR_UUID, payload.data, note=payload.note)
-
-    async def set_rgb(self, brightness: int, red: int, green: int, blue: int) -> None:
-        """Set RGB via characteristic 0005 (less reliable than 0007)."""
-        await self._write(
-            RGB_UUID,
-            bytes([brightness, red, green, blue]),
-            note="rgb via 0005 (limited support)",
-        )
-
-    async def _write(self, uuid: str, data: bytes, note: Optional[str] = None) -> None:
+    async def _write(self, uuid: str, data: bytes, note: str | None = None) -> None:
         suffix = f" ({note})" if note else ""
         log.info("WRITE uuid=%s response=False data=0x%s%s", uuid, data.hex(), suffix)
         await self.client.write_gatt_char(uuid, data, response=False)
         log.info("Done.")
-
-
-
-
 
 
 def parse_hex_payload(value: str) -> bytes:
@@ -148,27 +137,39 @@ def require_int_range(name: str, value: int, min_value: int, max_value: int) -> 
     return value
 
 
+def build_wakeup_payload(command: WakeupCommand) -> None:
+    pass
+
+
+def build_timer_payload(command: TimerCommand) -> None:
+    pass
+
+
+def build_sleep_payload(command: SleepCommand) -> None:
+    pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Control Hue lightstrip over BLE.")
-    parser.add_argument("--device", default=LIGHT_NAME, help="BLE device name.")
+    parser.add_argument(
+        "-d",
+        "--device",
+        default=DEFAULT_DEVICE_NAME,
+        help="BLE device name.",
+    )
     parser.add_argument("--timeout", type=float, default=20.0, help="BLE scan timeout.")
 
-    subparsers = parser.add_subparsers(dest="command")#, required=True)
+    subparsers = parser.add_subparsers(dest="command")  # , required=True)
 
     power = subparsers.add_parser("power", help="Turn the light on or off.")
     power.add_argument("state", choices=["on", "off"], help="Power state.")
     power.add_argument("brightness", nargs="?", type=int, help="Brightness 1-255 when on.")
 
-    parser.add_argument('--color', choices=PRESET_COLORS.keys(),
-                        default='honolulu', help='preset color name',)
-    #parser.add_argument("--color", choices=PRESET_PAYLOADS.keys(), default="honolulu")
     parser.add_argument(
-    "--customize", action="store_true", help="Start HTTP server and keep BLE connection open",
-)
-
-
-
-    
+        "--customize",
+        action="store_true",
+        help="Start HTTP server and keep BLE connection open",
+    )
 
     rgb = subparsers.add_parser(
         "rgb",
@@ -179,13 +180,80 @@ def build_parser() -> argparse.ArgumentParser:
     rgb.add_argument("--green", type=int, default=0)
     rgb.add_argument("--blue", type=int, default=0)
 
+    wakeup = subparsers.add_parser("wakeup", help="Create a wakeup command.")
+    wakeup.add_argument("--time", required=True, help="Human-readable wakeup time.")
+    wakeup.add_argument(
+        "--mode",
+        choices=["sunrise", "fullbright"],
+        required=True,
+        help="Wakeup mode.",
+    )
+    wakeup.add_argument(
+        "--fade-in",
+        dest="fade_in",
+        type=int,
+        choices=[10, 20, 30],
+        required=True,
+        help="Fade-in time in minutes.",
+    )
+    wakeup.add_argument(
+        "--deactive",
+        action="store_true",
+        help="Create as inactive.",
+    )
+
+    timer = subparsers.add_parser("timer", help="Create a timer command.")
+    timer.add_argument("--duration", required=True, help="Timer duration.")
+    timer.add_argument(
+        "--effect",
+        choices=["flash", "on", "off"],
+        required=True,
+        help="Timer effect.",
+    )
+    timer.add_argument(
+        "--deactive",
+        action="store_true",
+        help="Create as inactive.",
+    )
+
+    sleep = subparsers.add_parser("sleep", help="Create a sleep command.")
+    sleep.add_argument("--time", required=True, help="Human-readable sleep time.")
+    sleep.add_argument("--mode", help="Sleep mode.")
+    sleep.add_argument(
+        "--deactive",
+        action="store_true",
+        help="Create as inactive.",
+    )
+
+    dev = subparsers.add_parser("dev", help="Developer utilities.")
+    dev_subparsers = dev.add_subparsers(dest="dev_command", required=True)
+
+    dev_set = dev_subparsers.add_parser(
+        "set-characteristic",
+        help="Send raw hex data to a characteristic.",
+    )
+    dev_set.add_argument(
+        "--characteristic",
+        required=True,
+        help="Characteristic UUID to write.",
+    )
+    dev_set.add_argument(
+        "--data",
+        required=True,
+        help="Hex payload (e.g. '01ff 02').",
+    )
+
+    dev_subparsers.add_parser(
+        "subscribe-all",
+        help="Subscribe to all notifiable characteristics.",
+    )
+
     return parser
 
 
-
-
-
-def start_customize_server(loop: asyncio.AbstractEventLoop, queue: "asyncio.Queue[bytes]", light:HueLight):
+def start_customize_server(
+    loop: asyncio.AbstractEventLoop, queue: "asyncio.Queue[bytes]", light: HueLight
+):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -200,33 +268,22 @@ def start_customize_server(loop: asyncio.AbstractEventLoop, queue: "asyncio.Queu
                     self.wfile.write(f.read())
                 return
 
-
             # Handle power control
             if parsed.path == "/power":
                 qs = parse_qs(parsed.query)
                 if "state" in qs:
                     state = qs["state"][0]
-            
+
                     if state == "on":
                         # default ON brightness
-                        loop.call_soon_threadsafe(
-                            asyncio.create_task,
-                            light.set_power(True, 0xFE)
-                        )
+                        loop.call_soon_threadsafe(asyncio.create_task, light.set_power(True, 0xFE))
                     elif state == "off":
-                        loop.call_soon_threadsafe(
-                            asyncio.create_task,
-                            light.set_power(False, None)
-                        )
-            
+                        loop.call_soon_threadsafe(asyncio.create_task, light.set_power(False, None))
+
                     self.send_response(200)
                     self.end_headers()
                     self.wfile.write(b"OK")
                     return
-
-
-
-
 
             # Handle color send
             if parsed.path == "/send":
@@ -267,14 +324,48 @@ async def ble_writer(light: "HueLight", queue: "asyncio.Queue[bytes]") -> None:
             queue.task_done()
 
 
+async def run(args: argparse.Namespace, config: Config) -> None:
+    if args.command == "power":
+        light = await HueLight.connect(config)
+        try:
+            brightness = None
+            if args.state == "on" and args.brightness is not None:
+                brightness = require_int_range("Brightness", args.brightness, 1, 255)
+            await light.set_power(args.state == "on", brightness)
+        finally:
+            await light.disconnect()
+        return
 
+    if args.command == "wakeup":
+        command = WakeupCommand(
+            time=args.time,
+            mode=args.mode,
+            fade_in=args.fade_in,
+            active=not args.deactive,
+        )
+        build_wakeup_payload(command)
+        return
 
+    if args.command == "timer":
+        command = TimerCommand(
+            duration=args.duration,
+            effect=args.effect,
+            active=not args.deactive,
+        )
+        build_timer_payload(command)
+        return
 
-
-async def run(args: argparse.Namespace) -> None:
-    light = await HueLight.connect(args.device, timeout=args.timeout)
+    if args.command == "sleep":
+        command = SleepCommand(
+            time=args.time,
+            mode=args.mode,
+            active=not args.deactive,
+        )
+        build_sleep_payload(command)
+        return
 
     if args.customize:
+        light = await HueLight.connect(config)
         print("Customize mode enabled.")
 
         loop = asyncio.get_running_loop()
@@ -294,65 +385,37 @@ async def run(args: argparse.Namespace) -> None:
             writer_task.cancel()
         return
 
-    
-
-    #if hasattr(args, "color") and args.color:
-    #    brightness, red, green, blue = PRESET_COLORS[args.color]
-    #    await light.set_rgb(brightness, red, green, blue)
-    #    #payload = PRESET_PAYLOADS[args.color]
-    #    #await light.set_color_payload(ColorPayload(payload, note=f"preset {args.color}"))
-    #    return
-
-
-    try:
-        if args.command == "power":
-            brightness = None
-            if args.state == "on" and args.brightness is not None:
-                brightness = require_int_range("Brightness", args.brightness, 1, 255)
-            await light.set_power(args.state == "on", brightness)
-            return
-
-#        if args.command == "color":
-            if args.raw:
-                payload = ColorPayload(parse_hex_payload(args.raw), note="raw payload")
-                await light.set_color_payload(payload)
-                return
-
-            brightness = require_int_range("Brightness", args.brightness, 1, 255)
-            red = require_int_range("Red", args.red, 0, 255)
-            green = require_int_range("Green", args.green, 0, 255)
-            blue = require_int_range("Blue", args.blue, 0, 255)
-            temperature = require_int_range("Temperature", args.temperature, 0, 65535)
-            prefix = parse_hex_payload(args.prefix)
-            color = HueColor(
-                brightness=brightness,
-                red=red,
-                green=green,
-                blue=blue,
-                temperature=temperature,
-                prefix=prefix,
+    if args.command == "dev":
+        if args.dev_command == "set-characteristic":
+            payload = parse_hex_payload(args.data)
+            await set_characteristic(
+                config.device_name,
+                args.characteristic,
+                payload,
+                timeout=config.timeout,
             )
-            await light.set_color(color)
             return
 
-        if args.command == "rgb":
-            brightness = require_int_range("Brightness", args.brightness, 1, 255)
-            red = require_int_range("Red", args.red, 0, 255)
-            green = require_int_range("Green", args.green, 0, 255)
-            blue = require_int_range("Blue", args.blue, 0, 255)
-            await light.set_rgb(brightness, red, green, blue)
+        if args.dev_command == "subscribe-all":
+            await subscribe_all(config.device_name, timeout=config.timeout)
             return
-    finally:
-        await light.disconnect()
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    config = Config(device_name=args.device, timeout=args.timeout)
+    log.info("Using device '%s'", config.device_name)
     try:
-        asyncio.run(run(args))
+        asyncio.run(run(args, config))
     except KeyboardInterrupt:
         log.info("Interrupted.")
+    except SystemExit:
+        log.error("Operation failed with config=%s", config)
+        raise
+    except Exception:
+        log.exception("Operation failed with config=%s", config)
+        raise
 
 
 if __name__ == "__main__":

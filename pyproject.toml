@@ -7,3 +7,12 @@ requires-python = ">=3.13"
 dependencies = [
     "bleak>=2.1.1",
 ]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["scripts"]
