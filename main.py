@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 from bleak import BleakClient, BleakScanner
 
 from scripts.delete_alarms import delete_alarms
+from scripts.enable_alarms import enable_alarms
 from scripts.read_alarms import read_alarms
 from scripts.set_characteristic import set_characteristic
 from scripts.subscribe_all import subscribe_all
@@ -335,6 +336,11 @@ def build_args() -> argparse.ArgumentParser:
         help="Delete all alarm slots from the lamp.",
     )
 
+    dev_subparsers.add_parser(
+        "enable-alarms",
+        help="Enable all inactive alarm slots on the lamp.",
+    )
+
     return parser
 
 
@@ -490,6 +496,10 @@ async def run(args: argparse.Namespace, config: Config) -> None:
 
         if args.dev_command == "delete-alarms":
             await delete_alarms(config.device_name, timeout=config.timeout)
+            return
+
+        if args.dev_command == "enable-alarms":
+            await enable_alarms(config.device_name, timeout=config.timeout)
             return
 
 
