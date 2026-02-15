@@ -1,27 +1,23 @@
 """Simple BLE controller for Hue lightstrip plus."""
 
 from __future__ import annotations
-from datetime import datetime
-
 
 import argparse
 import asyncio
-from enum import StrEnum
 import enum
 import logging
 import os
+import struct
 import threading
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from bleak import BleakClient, BleakScanner
 
-from scripts.delete_alarms import delete_alarms
-from scripts.enable_alarms import enable_alarms
-from scripts.read_alarms import read_alarms
-from scripts.set_characteristic import set_characteristic
 from scripts.subscribe_all import subscribe_all
 
 DEFAULT_DEVICE_NAME = "Hue lightstrip plus"
@@ -31,6 +27,11 @@ RGB_UUID = "932c32bd-0005-47a2-835a-a8d455b859dd"
 TIMER_UUID = "9da2ddf1-0001-44d0-909c-3f3d3cb34a7b"
 DEFAULT_BRIGHTNESS = 0xFE
 TIME_FORMAT = "%Y-%m-%d %H:%M"
+NOTIFICATION_TIMEOUT = 10.0
+
+EXPECTED_DELETE_ACK_TYPE = 0x03
+EXPECTED_DELETE_CONFIRM_TYPE = 0x04
+EXPECTED_CONFIRM_TRAILER = bytes([0xFF, 0xFF])
 
 
 logging.basicConfig(
@@ -76,10 +77,28 @@ class SleepCommand:
 
 
 @dataclass
+class AlarmProperties:
+    active: bool
+    timestamp: datetime
+    mystery_bytes: bytes
+    name: str
+
+
+@dataclass
+class Alarm:
+    slot_id: int
+    raw: bytes
+    payload: bytes
+    payload_length: int
+    properties: AlarmProperties
+
+
+@dataclass
 class HueLight:
     client: BleakClient
     name: str
     address: str
+    timer_notification_queue: asyncio.Queue[bytes] = asyncio.Queue()
 
     @classmethod
     async def connect(cls, config: Config) -> HueLight:
@@ -108,9 +127,9 @@ class HueLight:
         log.info("READ uuid=%s data=0x%s", POWER_UUID, readback_bytes.hex())
         return readback_bytes
 
-    async def _confirm_power(self, target_on: bool, value: bytes) -> None:
+    async def _confirm_power(self, target_on: bool) -> None:
         target_label = "on" if target_on else "off"
-        for _attempt in range(20):
+        for _ in range(20):
             readback = await self.read_power()
             if readback:
                 state_on = readback[0] != 0x00
@@ -123,13 +142,13 @@ class HueLight:
     async def set_power(self, on: bool, brightness: int | None) -> None:
         value = bytes([brightness if brightness is not None else 0x01]) if on else bytes([0x00])
         await self._write(POWER_UUID, value, note="power")
-        await self._confirm_power(on, value)
+        await self._confirm_power(on)
 
     async def _write(self, uuid: str, data: bytes, note: str | None = None) -> None:
         suffix = f" ({note})" if note else ""
         formatted_hex = " ".join(data.hex()[i : i + 2] for i in range(0, len(data.hex()), 2))
         log.info("WRITE uuid=%s response=False data=0x%s%s", uuid, formatted_hex, suffix)
-        await self.client.write_gatt_char(uuid, data, response=False)
+        await self.client.write_gatt_char(uuid, data, response=True)
         log.info("WRITE Complete")
 
     async def set_alarm(self, data: bytes, note: str | None = None) -> None:
@@ -142,7 +161,67 @@ class HueLight:
             suffix,
         )
         log.info("      formatted: %s", formatted_hex)
+        # TODO: This does not work so disabled
         # await self.client.write_gatt_char(TIMER_UUID, data, response=False)
+
+    async def list_alarm_ids(self) -> list[int]:
+        """Parse the slot list notification response.
+
+        Format: [0x00=type] [status] [unknown] [count] [slot_id LE16]...
+        """
+        LIST_TIMERS_MSG = bytes([0x00])
+        await self.client.write_gatt_char(TIMER_UUID, LIST_TIMERS_MSG, response=True)
+
+        data = await asyncio.wait_for(
+            self.timer_notification_queue.get(), timeout=NOTIFICATION_TIMEOUT
+        )
+
+        slot_ids = parse_alarm_ids(data)
+        return slot_ids
+
+    async def read_alarms(self) -> list[Alarm]:
+        """Connect to the lamp, read all alarm slots, and return parsed data."""
+
+        client = self.client
+        slot_ids = await self.list_alarm_ids()
+
+        slots: list[Alarm] = []
+        for slot_id in slot_ids:
+            lo = slot_id & 0xFF
+            hi = (slot_id >> 8) & 0xFF
+            TIMER_INFO_MSG = bytes([0x02, lo, hi, 0x00, 0x00])
+            await client.write_gatt_char(TIMER_UUID, TIMER_INFO_MSG, response=True)
+            response = await asyncio.wait_for(
+                self.timer_notification_queue.get(), timeout=NOTIFICATION_TIMEOUT
+            )
+            try:
+                slot = parse_alarm(response)
+            except ValueError as exc:
+                print(f"  Error parsing slot {response}: {exc}")
+                continue
+            slots.append(slot)
+
+        return slots
+
+    async def enable_alarm(self, alarm: Alarm):
+        msg = alarm.payload
+
+        # TODO: Needs testing
+        await self._write(TIMER_UUID, msg, "Enabling Timer")
+
+        # TODO: Print this and get the value and confirm the response
+        ack = await asyncio.wait_for(
+            self.timer_notification_queue.get(),
+            timeout=NOTIFICATION_TIMEOUT,
+        )
+        print(f"  ACK:     {format_hex(ack)}")
+        # TODO: Print this and get the value and confirm the response
+        confirm = await asyncio.wait_for(
+            self.timer_notification_queue.get(), timeout=NOTIFICATION_TIMEOUT
+        )
+        print(f"  Confirm: {format_hex(confirm)}")
+
+        return
 
 
 def parse_hex_payload(value: str) -> bytes:
@@ -155,13 +234,29 @@ def parse_hex_payload(value: str) -> bytes:
         raise SystemExit(f"Invalid hex payload: {value}.") from exc
 
 
+def parse_alarm_ids(data: bytes) -> list[int]:
+    if len(data) < 4:
+        raise ValueError(f"Slot list response too short: {len(data)} bytes")
+    if data[0] != 0x00:
+        raise ValueError(f"Expected response type 0x00 for slot list, got 0x{data[0]:02x}")
+    if data[1] != 0x00:
+        raise ValueError(f"Slot list status not OK: 0x{data[1]:02x}")
+
+    count = data[3]
+    slot_ids = []
+    for i in range(count):
+        offset = 4 + i * 2
+        if offset + 2 > len(data):
+            break
+        slot_ids.append(struct.unpack_from("<H", data, offset)[0])
+
+    return slot_ids
+
+
 def require_int_range(name: str, value: int, min_value: int, max_value: int) -> int:
     if not min_value <= value <= max_value:
         raise SystemExit(f"{name} must be between {min_value} and {max_value}, got {value}.")
     return value
-
-
-import struct
 
 
 def datetime_to_hex_little_endian(dt):
@@ -295,7 +390,7 @@ def build_args() -> argparse.ArgumentParser:
     )
 
     sleep = subparsers.add_parser("sleep", help="Create a sleep command.")
-    sleep.add_argument("--time", required=True, help=f"wakeup time in format {TIME_FORMAT}")
+    sleep.add_argument("--time", required=True, help=f"sleep time in format {TIME_FORMAT}")
     sleep.add_argument("--mode", help="Sleep mode.")
     sleep.add_argument(
         "--deactive",
@@ -433,8 +528,168 @@ def run_customize_mode(config: Config) -> None:
         asyncio.run(light.disconnect())
 
 
-async def run(args: argparse.Namespace, config: Config) -> None:
-    light = await HueLight.connect(config)
+def parse_alarm(data: bytes) -> Alarm:
+    """Parse an individual alarm slot notification response."""
+    if len(data) < 6:
+        raise ValueError(f"Alarm slot response too short: {len(data)} bytes")
+    if data[0] != 0x02:
+        raise ValueError(f"Expected response type 0x02, got 0x{data[0]:02x}")
+    if data[1] != 0x00:
+        raise ValueError(f"Alarm slot status not OK: 0x{data[1]:02x}")
+
+    slot_id = struct.unpack_from("<H", data, 2)[0]
+    payload_length = data[4]
+    payload = data[8:]
+    assert len(payload) == payload_length, (
+        f"Alarm slot payload length {payload_length} exceeds response payload {len(payload)}"
+    )
+
+    core = parse_alarm_properties(data)
+
+    return Alarm(
+        slot_id=slot_id,
+        raw=data,
+        payload=payload,
+        payload_length=payload_length,
+        properties=core,
+    )
+
+
+def format_hex(data: bytes) -> str:
+    return " ".join(f"{b:04x}" for b in data)
+
+
+def parse_alarm_properties(data: bytes) -> AlarmProperties:
+    """Parse enabled flag, time stamp, and the leading mystery bytes from full response."""
+    ACTIVE_INDEX = 9
+    TIMESTAMP_START = 11
+
+    if len(data) < TIMESTAMP_START + 1:
+        raise ValueError(
+            f"Alarm response too short: {len(data)} bytes, need at least {TIMESTAMP_START + 4}"
+        )
+
+    active_value = data[ACTIVE_INDEX]
+    if active_value not in (0x00, 0x01):
+        raise ValueError(f"Invalid active flag: 0x{active_value:02x}, expected 0x00 or 0x01")
+
+    timestamp_value = struct.unpack_from("<I", data, TIMESTAMP_START)[0]
+    try:
+        timestamp = datetime.fromtimestamp(timestamp_value, tz=UTC)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Invalid timestamp value: {timestamp_value}") from exc
+
+    name = parse_alarm_name(data)
+    name_length_index, _ = find_alarm_name_segment(data)
+
+    mystery_bytes = data[TIMESTAMP_START + 4 : name_length_index]
+
+    return AlarmProperties(
+        active=active_value == 0x01, timestamp=timestamp, mystery_bytes=mystery_bytes, name=name
+    )
+
+
+# TODO: Refactor. Just iterate back on the data, first byte is 0 then it's some characters.
+# Keep coming back and add characters until you find a number that
+# matches the number of characters you matched.
+def find_alarm_name_segment(data: bytes) -> tuple[int, bytes]:
+    """Find name segment in full response data (searches in payload portion starting at byte 6)."""
+    PAYLOAD_START = 6
+    if len(data) < PAYLOAD_START:
+        raise ValueError("Alarm response too short for payload")
+
+    for marker_index in range(len(data) - 1, PAYLOAD_START - 1, -1):
+        if data[marker_index] != 0x00:
+            continue
+
+        collected = bytearray()
+        for index in range(marker_index - 1, PAYLOAD_START - 1, -1):
+            value = data[index]
+            if value == len(collected):
+                if not collected:
+                    raise ValueError("Alarm payload invalid name length")
+                name_bytes = data[index + 1 : marker_index]
+                if not is_printable_ascii(name_bytes):
+                    raise ValueError(f"Alarm payload name not printable: {name_bytes.hex()}")
+                return index, name_bytes
+            if not (0x20 <= value <= 0x7E):
+                break
+            collected.append(value)
+
+    raise ValueError("Alarm payload name not found")
+
+
+def parse_alarm_name(data: bytes) -> str:
+    """Parse alarm name from full response by scanning backward for 0x00, then length+name bytes."""
+    _, name_bytes = find_alarm_name_segment(data)
+    return name_bytes.decode("ascii")
+
+
+def is_printable_ascii(data: bytes) -> bool:
+    return all(0x20 <= b <= 0x7E for b in data)
+
+
+def print_alarm_report(slots: list[Alarm]) -> None:
+    print("\n" + "=" * 70)
+    print("ALARM DUMP REPORT")
+    print("=" * 70)
+
+    for slot in slots:
+        print(f"\n--- Slot 0x{slot.slot_id:04x} ({slot.slot_id}) ---")
+        print(f"  Raw hex ({len(slot.raw)} bytes):")
+        print(f"    {format_hex(slot.raw)}")
+        print(f"  Payload length: {slot.payload_length}")
+        print(f"  Payload: {format_hex(slot.payload)}")
+        print(f"  Active:         {slot.properties.active}")
+        print(f"  Timestamp:      {slot.properties.timestamp}")
+        print(f"  Name:           '{slot.properties.name}'")
+        print(f"  Mystery bytes:  {format_hex(slot.properties.mystery_bytes)}")
+
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"{'Slot':>8}  {'Active':>6}  {'Name':<20}  {'Timestamp':<26}")
+    print("-" * 75)
+    for slot in slots:
+        time_str = slot.properties.timestamp.isoformat()
+        active_str = "  YES" if slot.properties.active else "   NO"
+        print(
+            f"  0x{slot.slot_id:04x}  {active_str:>6}  {slot.properties.name:<20}  {time_str:<26}"
+        )
+    print()
+
+
+def check_delete_ack(slot_id: int, data: bytes) -> bool:
+    """Check if delete ACK matches expected: 03 00 <lo> <hi>."""
+    lo = slot_id & 0xFF
+    hi = (slot_id >> 8) & 0xFF
+    expected = bytes([EXPECTED_DELETE_ACK_TYPE, 0x00, lo, hi])
+    return data == expected
+
+
+def check_delete_confirm(slot_id: int, data: bytes) -> bool:
+    """Check if delete confirmation matches expected: 04 <lo> <hi> FF FF."""
+    lo = slot_id & 0xFF
+    hi = (slot_id >> 8) & 0xFF
+    expected = bytes([EXPECTED_DELETE_CONFIRM_TYPE, lo, hi]) + EXPECTED_CONFIRM_TRAILER
+    return data == expected
+
+
+async def run(args: argparse.Namespace, c: Config) -> None:
+    light = await HueLight.connect(c)
+
+    def on_notify(_, data: bytearray):
+        light.timer_notification_queue.put_nowait(bytes(data))
+
+    # Sub to timer to get responses when interacting with timers
+    await light.client.start_notify(TIMER_UUID, on_notify)
+
+    await handle_command(args, light, c)
+
+    await light.client.stop_notify(TIMER_UUID)
+
+
+async def handle_command(args: argparse.Namespace, light: HueLight, c: Config):
     if args.command == "power":
         try:
             brightness = None
@@ -443,7 +698,6 @@ async def run(args: argparse.Namespace, config: Config) -> None:
             await light.set_power(args.state == "on", brightness)
         finally:
             await light.disconnect()
-        return
 
     if args.command == "wakeup":
         command = WakeupCommand(
@@ -455,7 +709,6 @@ async def run(args: argparse.Namespace, config: Config) -> None:
             edit=args.edit,
         )
         await light.set_alarm(build_wakeup_payload(command))
-        return
 
     if args.command == "timer":
         command = TimerCommand(
@@ -464,7 +717,6 @@ async def run(args: argparse.Namespace, config: Config) -> None:
             active=not args.deactive,
         )
         build_timer_payload(command)
-        return
 
     if args.command == "sleep":
         command = SleepCommand(
@@ -473,34 +725,59 @@ async def run(args: argparse.Namespace, config: Config) -> None:
             active=not args.deactive,
         )
         build_sleep_payload(command)
-        return
 
     if args.command == "dev":
         if args.dev_command == "set-characteristic":
             payload = parse_hex_payload(args.data)
-            await set_characteristic(
-                config.device_name,
-                args.characteristic,
-                payload,
-                timeout=config.timeout,
-            )
-            return
-
-        if args.dev_command == "subscribe-all":
-            await subscribe_all(config.device_name, timeout=config.timeout)
-            return
+            await light._write(args.characteristic, payload)
 
         if args.dev_command == "read-alarms":
-            await read_alarms(config.device_name, timeout=config.timeout)
-            return
+            alarms = await light.read_alarms()
+            print_alarm_report(alarms)
+
+        if args.dev_command == "subscribe-all":
+            # TODO: Inline this like the other dev commands
+            await subscribe_all(c.device_name, timeout=c.timeout)
 
         if args.dev_command == "delete-alarms":
-            await delete_alarms(config.device_name, timeout=config.timeout)
-            return
+            alarms = await light.read_alarms()
+            ids = await light.list_alarm_ids()
+
+            for id in ids:
+                # TODO: Explain what is this
+                lo = id & 0xFF
+                hi = (id >> 8) & 0xFF
+                cmd = bytes([0x03, lo, hi])
+                print(f"\nDeleting slot 0x{id:04x} -> write {format_hex(cmd)}")
+                await light.client.write_gatt_char(TIMER_UUID, cmd, response=True)
+
+                ack = await asyncio.wait_for(
+                    light.timer_notification_queue.get(),
+                    timeout=NOTIFICATION_TIMEOUT,
+                )
+                confirm = await asyncio.wait_for(
+                    light.timer_notification_queue.get(), timeout=NOTIFICATION_TIMEOUT
+                )
+                ack_ok = check_delete_ack(id, ack)
+                confirm_ok = check_delete_confirm(id, confirm)
+
+                print(f"  ACK:     {format_hex(ack)}  {'OK' if ack_ok else 'UNEXPECTED'}")
+                print(f"  Confirm: {format_hex(confirm)}  {'OK' if confirm_ok else 'UNEXPECTED'}")
+
+                if not ack_ok:
+                    expected_ack = bytes([0x03, 0x00, lo, hi])
+                    print(f"  Expected ACK:     {format_hex(expected_ack)}")
+                if not confirm_ok:
+                    expected_conf = bytes([0x04, lo, hi]) + EXPECTED_CONFIRM_TRAILER
+                    print(f"  Expected Confirm: {format_hex(expected_conf)}")
 
         if args.dev_command == "enable-alarms":
-            await enable_alarms(config.device_name, timeout=config.timeout)
-            return
+            alarms = await light.read_alarms()
+
+            for alarm in alarms:
+                if alarm.properties.active:
+                    continue
+                await light.enable_alarm(alarm)
 
 
 def main() -> None:
