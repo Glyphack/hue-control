@@ -540,9 +540,10 @@ def parse_alarm(data: bytes) -> Alarm:
     slot_id = struct.unpack_from("<H", data, 2)[0]
     payload_length = data[4]
     payload = data[8:]
-    assert len(payload) == payload_length, (
-        f"Alarm slot payload length {payload_length} exceeds response payload {len(payload)}"
-    )
+    if len(payload) != payload_length:
+        raise ValueError(
+            f"Alarm slot payload length {payload_length} exceeds response payload {len(payload)}"
+        )
 
     core = parse_alarm_properties(data)
 
