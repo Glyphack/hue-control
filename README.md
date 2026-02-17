@@ -25,7 +25,7 @@ uv run main.py --device "Hue lightstrip" power on
 ## Usage
 
 ```text
-uv run main.py --help
+uvx huec --help
 usage: main.py [-h] [--debug] [-d DEVICE] [--timeout TIMEOUT]
                {interactive,power,color,alarms,dev} ...
 
