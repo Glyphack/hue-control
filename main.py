@@ -10,9 +10,11 @@ import os
 import struct
 import threading
 import time
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from functools import wraps
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -39,6 +41,50 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("hue-control")
+
+
+class PowerStateMismatchError(RuntimeError):
+    """Raised when power readback does not match desired state."""
+
+
+def retry_async(
+    *,
+    attempts: int,
+    delay_seconds: float,
+    operation: str,
+) -> Callable[[Callable[..., Awaitable[None]]], Callable[..., Awaitable[None]]]:
+    """Retry async operations that raise exceptions."""
+    if attempts < 1:
+        raise ValueError("attempts must be >= 1")
+
+    def decorator(func: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable[None]]:
+        @wraps(func)
+        async def wrapper(*args, **kwargs) -> None:
+            last_error: Exception | None = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    await func(*args, **kwargs)
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    if attempt == attempts:
+                        break
+                    log.warning(
+                        "%s failed (attempt %d/%d): %s. Retrying in %.1fs...",
+                        operation,
+                        attempt,
+                        attempts,
+                        exc,
+                        delay_seconds,
+                    )
+                    await asyncio.sleep(delay_seconds)
+
+            assert last_error is not None
+            raise RuntimeError(f"{operation} failed after {attempts} attempts.") from last_error
+
+        return wrapper
+
+    return decorator
 
 
 @dataclass(frozen=True)
@@ -98,7 +144,8 @@ class HueLight:
     client: BleakClient
     name: str
     address: str
-    timer_notification_queue: asyncio.Queue[bytes] = asyncio.Queue()
+    timer_notification_queue: asyncio.Queue[bytes] = field(default_factory=asyncio.Queue)
+    _timer_notifications_started: bool = field(default=False, init=False, repr=False)
 
     @classmethod
     async def connect(cls, config: Config) -> HueLight:
@@ -118,8 +165,32 @@ class HueLight:
         )
 
     async def disconnect(self) -> None:
-        if self.client.is_connected:
-            await self.client.disconnect()
+        if not self.client.is_connected:
+            return
+
+        await self.stop_timer_notifications()
+        await self.client.disconnect()
+
+    def _on_timer_notification(self, _, data: bytearray) -> None:
+        self.timer_notification_queue.put_nowait(bytes(data))
+
+    async def ensure_timer_notifications_started(self) -> None:
+        if self._timer_notifications_started:
+            return
+
+        await self.client.start_notify(TIMER_UUID, self._on_timer_notification)
+        self._timer_notifications_started = True
+
+    async def stop_timer_notifications(self) -> None:
+        if not self._timer_notifications_started:
+            return
+
+        await self.client.stop_notify(TIMER_UUID)
+        self._timer_notifications_started = False
+
+    async def next_timer_notification(self, timeout: float = NOTIFICATION_TIMEOUT) -> bytes:
+        await self.ensure_timer_notifications_started()
+        return await asyncio.wait_for(self.timer_notification_queue.get(), timeout=timeout)
 
     async def read_power(self) -> bytes:
         readback = await self.client.read_gatt_char(POWER_UUID)
@@ -127,22 +198,21 @@ class HueLight:
         log.info("READ uuid=%s data=0x%s", POWER_UUID, readback_bytes.hex())
         return readback_bytes
 
-    async def _confirm_power(self, target_on: bool) -> None:
-        target_label = "on" if target_on else "off"
-        for _ in range(20):
-            readback = await self.read_power()
-            if readback:
-                state_on = readback[0] != 0x00
-                if state_on == target_on:
-                    return
-            log.warning("Power not set yet (%s), retrying in 0.3s...", target_label)
-            await asyncio.sleep(0.3)
-        log.error("Failed to confirm power %s after 20 attempts", target_label)
-
+    @retry_async(attempts=20, delay_seconds=0.3, operation="Setting power")
     async def set_power(self, on: bool, brightness: int | None) -> None:
         value = bytes([brightness if brightness is not None else 0x01]) if on else bytes([0x00])
         await self._write(POWER_UUID, value, note="power")
-        await self._confirm_power(on)
+        readback = await self.read_power()
+        if not readback:
+            raise PowerStateMismatchError("Power readback was empty.")
+
+        current_on = readback[0] != 0x00
+        if current_on != on:
+            desired = "on" if on else "off"
+            actual = "on" if current_on else "off"
+            raise PowerStateMismatchError(
+                f"Power readback mismatch: expected {desired}, got {actual}."
+            )
 
     async def _write(self, uuid: str, data: bytes, note: str | None = None) -> None:
         suffix = f" ({note})" if note else ""
@@ -172,9 +242,7 @@ class HueLight:
         LIST_TIMERS_MSG = bytes([0x00])
         await self.client.write_gatt_char(TIMER_UUID, LIST_TIMERS_MSG, response=True)
 
-        data = await asyncio.wait_for(
-            self.timer_notification_queue.get(), timeout=NOTIFICATION_TIMEOUT
-        )
+        data = await self.next_timer_notification()
 
         slot_ids = parse_alarm_ids(data)
         return slot_ids
@@ -191,9 +259,7 @@ class HueLight:
             hi = (slot_id >> 8) & 0xFF
             TIMER_INFO_MSG = bytes([0x02, lo, hi, 0x00, 0x00])
             await client.write_gatt_char(TIMER_UUID, TIMER_INFO_MSG, response=True)
-            response = await asyncio.wait_for(
-                self.timer_notification_queue.get(), timeout=NOTIFICATION_TIMEOUT
-            )
+            response = await self.next_timer_notification()
             try:
                 slot = parse_alarm(response)
             except ValueError as exc:
@@ -210,15 +276,10 @@ class HueLight:
         await self._write(TIMER_UUID, msg, "Enabling Timer")
 
         # TODO: Print this and get the value and confirm the response
-        ack = await asyncio.wait_for(
-            self.timer_notification_queue.get(),
-            timeout=NOTIFICATION_TIMEOUT,
-        )
+        ack = await self.next_timer_notification()
         print(f"  ACK:     {format_hex(ack)}")
         # TODO: Print this and get the value and confirm the response
-        confirm = await asyncio.wait_for(
-            self.timer_notification_queue.get(), timeout=NOTIFICATION_TIMEOUT
-        )
+        confirm = await self.next_timer_notification()
         print(f"  Confirm: {format_hex(confirm)}")
 
         return
@@ -306,12 +367,12 @@ def build_wakeup_payload(command: WakeupCommand) -> bytes:
     raise AssertionError()
 
 
-def build_timer_payload(command: TimerCommand) -> None:
-    pass
+def build_timer_payload(command: TimerCommand) -> bytes:
+    raise NotImplementedError("Timer payload builder is not implemented yet.")
 
 
-def build_sleep_payload(command: SleepCommand) -> None:
-    pass
+def build_sleep_payload(command: SleepCommand) -> bytes:
+    raise NotImplementedError("Sleep payload builder is not implemented yet.")
 
 
 def build_args() -> argparse.ArgumentParser:
@@ -324,17 +385,15 @@ def build_args() -> argparse.ArgumentParser:
     )
     parser.add_argument("--timeout", type=float, default=15.0, help="BLE scan timeout.")
 
-    subparsers = parser.add_subparsers(dest="command")  # , required=True)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser(
+        "customize",
+        help="Start HTTP server and keep BLE connection open.",
+    )
 
     power = subparsers.add_parser("power", help="Turn the light on or off.")
     power.add_argument("state", choices=["on", "off"], help="Power state.")
-    power.add_argument("brightness", nargs="?", type=int, help="Brightness 1-255 when on.")
-
-    parser.add_argument(
-        "--customize",
-        action="store_true",
-        help="Start HTTP server and keep BLE connection open",
-    )
 
     rgb = subparsers.add_parser(
         "rgb",
@@ -345,12 +404,12 @@ def build_args() -> argparse.ArgumentParser:
     rgb.add_argument("--green", type=int, default=0)
     rgb.add_argument("--blue", type=int, default=0)
 
-    wakeup = subparsers.add_parser("wakeup", help="Create a wakeup command.")
+    wakeup = subparsers.add_parser("wakeup", help="Create a wakeup command (temporarily disabled).")
     wakeup.add_argument("--name", required=True, help="Name of the alarm")
     wakeup.add_argument("--time", required=True, help=f"wakeup time in format {TIME_FORMAT}")
     wakeup.add_argument(
         "--mode",
-        choices=["sunrise", "fullbright"],
+        choices=["sunrise", "full_bright"],
         required=True,
         help="Wakeup mode.",
     )
@@ -375,7 +434,7 @@ def build_args() -> argparse.ArgumentParser:
         default=False,
     )
 
-    timer = subparsers.add_parser("timer", help="Create a timer command.")
+    timer = subparsers.add_parser("timer", help="Create a timer command (temporarily disabled).")
     timer.add_argument("--duration", required=True, help="Timer duration in seconds")
     timer.add_argument(
         "--effect",
@@ -389,7 +448,7 @@ def build_args() -> argparse.ArgumentParser:
         help="Create as inactive.",
     )
 
-    sleep = subparsers.add_parser("sleep", help="Create a sleep command.")
+    sleep = subparsers.add_parser("sleep", help="Create a sleep command (temporarily disabled).")
     sleep.add_argument("--time", required=True, help=f"sleep time in format {TIME_FORMAT}")
     sleep.add_argument("--mode", help="Sleep mode.")
     sleep.add_argument(
@@ -423,17 +482,17 @@ def build_args() -> argparse.ArgumentParser:
 
     dev_subparsers.add_parser(
         "read-alarms",
-        help="Read and dump all alarm slots from the lamp.",
+        help="Read and dump all alarm slots from the lamp (temporarily disabled).",
     )
 
     dev_subparsers.add_parser(
         "delete-alarms",
-        help="Delete all alarm slots from the lamp.",
+        help="Delete all alarm slots from the lamp (temporarily disabled).",
     )
 
     dev_subparsers.add_parser(
         "enable-alarms",
-        help="Enable all inactive alarm slots on the lamp.",
+        help="Enable all inactive alarm slots on the lamp (temporarily disabled).",
     )
 
     return parser
@@ -678,29 +737,18 @@ def check_delete_confirm(slot_id: int, data: bytes) -> bool:
 
 async def run(args: argparse.Namespace, c: Config) -> None:
     light = await HueLight.connect(c)
-
-    def on_notify(_, data: bytearray):
-        light.timer_notification_queue.put_nowait(bytes(data))
-
-    # Sub to timer to get responses when interacting with timers
-    await light.client.start_notify(TIMER_UUID, on_notify)
-
-    await handle_command(args, light, c)
-
-    await light.client.stop_notify(TIMER_UUID)
+    try:
+        await handle_command(args, light, c)
+    finally:
+        await light.disconnect()
 
 
 async def handle_command(args: argparse.Namespace, light: HueLight, c: Config):
     if args.command == "power":
-        try:
-            brightness = None
-            if args.state == "on" and args.brightness is not None:
-                brightness = require_int_range("Brightness", args.brightness, 1, 255)
-            await light.set_power(args.state == "on", brightness)
-        finally:
-            await light.disconnect()
+        await light.set_power(args.state == "on", None)
 
     if args.command == "wakeup":
+        raise SystemExit("The 'wakeup' command is temporarily disabled.")
         command = WakeupCommand(
             name=args.name,
             time=datetime.strptime(args.time, TIME_FORMAT),
@@ -712,6 +760,7 @@ async def handle_command(args: argparse.Namespace, light: HueLight, c: Config):
         await light.set_alarm(build_wakeup_payload(command))
 
     if args.command == "timer":
+        raise SystemExit("The 'timer' command is temporarily disabled.")
         command = TimerCommand(
             duration=args.duration,
             effect=args.effect,
@@ -720,6 +769,7 @@ async def handle_command(args: argparse.Namespace, light: HueLight, c: Config):
         build_timer_payload(command)
 
     if args.command == "sleep":
+        raise SystemExit("The 'sleep' command is temporarily disabled.")
         command = SleepCommand(
             time=args.time,
             mode=args.mode,
@@ -752,13 +802,8 @@ async def handle_command(args: argparse.Namespace, light: HueLight, c: Config):
                 print(f"\nDeleting slot 0x{id:04x} -> write {format_hex(cmd)}")
                 await light.client.write_gatt_char(TIMER_UUID, cmd, response=True)
 
-                ack = await asyncio.wait_for(
-                    light.timer_notification_queue.get(),
-                    timeout=NOTIFICATION_TIMEOUT,
-                )
-                confirm = await asyncio.wait_for(
-                    light.timer_notification_queue.get(), timeout=NOTIFICATION_TIMEOUT
-                )
+                ack = await light.next_timer_notification()
+                confirm = await light.next_timer_notification()
                 ack_ok = check_delete_ack(id, ack)
                 confirm_ok = check_delete_confirm(id, confirm)
 
@@ -784,11 +829,20 @@ async def handle_command(args: argparse.Namespace, light: HueLight, c: Config):
 def main() -> None:
     parser = build_args()
     args = parser.parse_args()
+    if args.command in {"wakeup", "timer", "sleep"}:
+        raise SystemExit(f"The '{args.command}' command is temporarily disabled.")
+    if args.command == "dev" and args.dev_command in {
+        "read-alarms",
+        "delete-alarms",
+        "enable-alarms",
+    }:
+        raise SystemExit(f"The 'dev {args.dev_command}' command is temporarily disabled.")
+
     config = Config(device_name=args.device, timeout=args.timeout)
     log.info("Using device '%s'", config.device_name)
 
     # Handle customize mode separately (not in async context)
-    if args.customize:
+    if args.command == "customize":
         print("Customize mode enabled.")
         try:
             run_customize_mode(config)
