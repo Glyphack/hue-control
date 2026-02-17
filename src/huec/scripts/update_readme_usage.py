@@ -31,7 +31,7 @@ def build_usage_section(help_text: str) -> list[str]:
         "## Usage",
         "",
         "```text",
-        "uv run main.py --help",
+        "uvx huec --help",
         help_text,
         "```",
         "",

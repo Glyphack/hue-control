@@ -4,12 +4,12 @@ Control Phillips Hue lights from your computer. No phone or Hue Bridge required!
 
 ## Setup
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and run the script with `uv run main.py`.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and run the script with `uvx huec`.
 
 Factory reset the lamp, then pair it using Bluetooth.
 
-- macOS: pair from Bluetooth settings.
-- Linux: pair with `bluetoothctl`.
+- Linux: pair with `bluetoothctl`. Then use `huec`
+- macOS: just run the power on command once and you get a prompt to pair with the light. Pair and then after that the app can connect to your light.
 
 Then use the cli tool to control hue light.
 

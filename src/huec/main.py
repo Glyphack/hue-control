@@ -301,7 +301,7 @@ async def handle_command(args: argparse.Namespace, light: HueLight, config: Conf
         return
 
     if args.command == "power":
-        await light.set_power(args.state == "on", None)
+        await light.set_power(args.state == "on")
         return
 
     if args.command == "color":
