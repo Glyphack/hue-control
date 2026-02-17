@@ -29,16 +29,6 @@ def configure_logging(debug: bool) -> None:
     log.setLevel(project_level)
 
 
-def parse_color_payload(value: str) -> bytes:
-    cleaned = value.lower().replace("0x", "").replace(" ", "").replace("\n", "")
-    if len(cleaned) % 2:
-        raise ValueError("Hex payload must have an even number of characters.")
-    try:
-        return bytes.fromhex(cleaned)
-    except ValueError as exc:
-        raise ValueError("Invalid hex payload.") from exc
-
-
 def build_args() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Control Hue lightstrip over BLE.")
     parser.add_argument(
@@ -252,7 +242,7 @@ async def run_interactive(light: HueLight) -> None:
                 if "data" in qs:
                     hex_string = qs["data"][0]
                     try:
-                        data_bytes = parse_color_payload(hex_string)
+                        data_bytes = hex_to_bin(hex_string)
                     except ValueError:
                         self.send_response(400)
                         self.end_headers()
@@ -306,7 +296,7 @@ async def handle_command(args: argparse.Namespace, light: HueLight, config: Conf
 
     if args.command == "color":
         try:
-            data = parse_color_payload(args.data)
+            data = hex_to_bin(args.data)
         except ValueError as exc:
             raise SystemExit(f"Invalid hex payload: {args.data}.") from exc
         await light.set_color(data)
@@ -359,10 +349,9 @@ async def handle_command(args: argparse.Namespace, light: HueLight, config: Conf
         if args.alarms_command == "enable":
             alarms = await light.get_alarms()
             if args.all:
-                alarms = [alarm for alarm in alarms if not alarm.properties.active]
-            if args.id:
-                alarms = [alarm for alarm in alarms if alarm._id == int(args.id)]
-
+                alarms = list(filter(lambda a: not a.properties.active, alarms))
+            if args.id is not None:
+                alarms = list(filter(lambda a: a._id == int(args.id), alarms))
             for alarm in alarms:
                 enable_result = await light.enable_alarm(alarm)
                 if not enable_result.is_ok():
@@ -371,10 +360,9 @@ async def handle_command(args: argparse.Namespace, light: HueLight, config: Conf
         if args.alarms_command == "disable":
             alarms = await light.get_alarms()
             if args.all:
-                alarms = [alarm for alarm in alarms if alarm.properties.active]
-            if args.id:
-                alarms = [alarm for alarm in alarms if alarm._id == int(args.id)]
-
+                alarms = list(filter(lambda a: a.properties.active, alarms))
+            if args.id is not None:
+                alarms = list(filter(lambda a: a._id == int(args.id), alarms))
             for alarm in alarms:
                 disable_result = await light.disable_alarm(alarm)
                 if not disable_result.is_ok():
