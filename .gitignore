@@ -1,5 +1,5 @@
 # Byte-compiled / optimized / DLL files
-__pycache__/
+**__pycache__/**
 *.py[codz]
 *$py.class
 
@@ -14,7 +14,10 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+!/lib/
+!/lib/**/*.py
+/lib/__pycache__/
+/lib/**/*.py[codz]
 lib64/
 parts/
 sdist/
@@ -48,7 +51,6 @@ coverage.xml
 *.cover
 *.py.cover
 .hypothesis/
-.pytest_cache/
 cover/
 
 # Translations
@@ -205,3 +207,4 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+alarm_dump.txt
