@@ -47,3 +47,8 @@ options:
   -d, --device DEVICE   BLE device name. Default is Hue lightstrip plus
   --timeout TIMEOUT     BLE scan timeout.
 ```
+
+## Development
+
+I tested it on my hue lightstrip and it works.
+If you have another hue light and it does not work file an issue.
