@@ -139,7 +139,7 @@ class HueLight:
 
     async def next_timer_notification(self, timeout: float = NOTIFICATION_TIMEOUT) -> bytes:
         resp = await asyncio.wait_for(self.timer_notification_queue.get(), timeout=timeout)
-        log.debug("Timer notification: %s", bin_to_hex(resp))
+        log.debug("Alarm notification: %s", bin_to_hex(resp))
         return resp
 
     async def write_characteristic(

@@ -328,7 +328,19 @@ async def handle_command(args: argparse.Namespace, light: HueLight, config: Conf
             id_width = 8
             active_width = 6
             name_width = 20
+            summary_rows = []
+            for alarm in alarms:
+                time_str = alarm.properties.timestamp.isoformat()
+                if not alarm.is_wake_up_or_sleep():
+                    duration = alarm.extract_timer_duration_seconds()
+                    time_str = f"{time_str} ({duration}s)"
+                active_str = "YES" if alarm.properties.active else "NO"
+                name_str = alarm.properties.name[:name_width]
+                summary_rows.append((alarm._id, active_str, name_str, time_str))
+
             timestamp_width = 26
+            if summary_rows:
+                timestamp_width = max(timestamp_width, max(len(row[3]) for row in summary_rows))
 
             le = id_width + active_width + name_width + timestamp_width + 6
 
@@ -339,15 +351,11 @@ async def handle_command(args: argparse.Namespace, light: HueLight, config: Conf
                 f"{'Timestamp':<{timestamp_width}}"
             )
             print("-" * le)
-            for alarm in alarms:
-                time_str = alarm.properties.timestamp.isoformat()
-                active_str = "YES" if alarm.properties.active else "NO"
-                name_str = alarm.properties.name[:name_width]
+            for alarm_id, active_str, name_str, time_str in summary_rows:
                 print(
-                    f"{alarm._id:>{id_width}}  {active_str:>{active_width}}  "
+                    f"{alarm_id:>{id_width}}  {active_str:>{active_width}}  "
                     f"{name_str:<{name_width}}  {time_str:<{timestamp_width}}"
                 )
-            print()
         if args.alarms_command == "enable":
             alarms = await light.get_alarms()
             if args.all:
