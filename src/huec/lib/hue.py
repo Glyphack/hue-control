@@ -236,7 +236,7 @@ class HueLight:
         response = await self.next_timer_notification()
         return parse_alarm(response)
 
-    async def _send_enable_alarm(
+    async def _send_alarm_command(
         self,
         alarm: Alarm,
         msg: bytes,
@@ -269,33 +269,11 @@ class HueLight:
 
     async def enable_alarm(self, alarm: Alarm) -> AlarmEnableResult:
         msg = build_enable_alarm_command(alarm)
-        return await self._send_enable_alarm(alarm, msg, note="Enabling timer")
+        return await self._send_alarm_command(alarm, msg, note="Enabling timer")
 
     async def disable_alarm(self, alarm: Alarm) -> AlarmEnableResult:
         msg = build_disable_alarm_command(alarm)
-        await self.write_characteristic(TIMER_UUID, msg, note="Disabling Alarm", response=False)
-
-        ack = b""
-        ack_ok = False
-        confirm = b""
-        confirm_ok = False
-        try:
-            ack = await self.next_timer_notification()
-            if len(ack) >= 2 and ack[0] == 0x01 and ack[1] == 0x00:
-                ack_ok = True
-        except TimeoutError:
-            ack_ok = False
-
-        try:
-            confirm = await self.next_timer_notification()
-            confirm_ok = True
-            # TODO: Validate confirm
-        except TimeoutError:
-            confirm_ok = False
-
-        return AlarmEnableResult(
-            slot_id=alarm._id, ack=ack, ack_ok=ack_ok, confirm=confirm, confirm_ok=confirm_ok
-        )
+        return await self._send_alarm_command(alarm, msg, note="Disabling Alarm")
 
     async def delete_alarm(self, a_id: int) -> AlarmDeleteResult:
         lo = a_id & 0xFF

@@ -47,7 +47,3 @@ async def subscribe_all(device_name: str, timeout: float = 20.0) -> None:
             await asyncio.Event().wait()
         except KeyboardInterrupt:
             pass
-
-
-def run_subscribe_all(device_name: str, timeout: float = 20.0) -> None:
-    asyncio.run(subscribe_all(device_name, timeout=timeout))
