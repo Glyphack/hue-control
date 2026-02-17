@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import logging
 import os
-import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -28,10 +27,6 @@ def configure_logging(debug: bool) -> None:
     logging.basicConfig(level=logging.WARNING, format=LOG_FORMAT, force=True)
     project_level = logging.DEBUG if debug else logging.WARNING
     log.setLevel(project_level)
-
-
-def print_error(message: str) -> None:
-    print(message, file=sys.stderr)
 
 
 def parse_color_payload(value: str) -> bytes:
@@ -429,12 +424,12 @@ def main() -> None:
         raise SystemExit(130) from None
     except SystemExit as exc:
         if isinstance(exc.code, str) and exc.code:
-            print_error(exc.code)
+            print(exc.code)
             raise SystemExit(1) from None
         raise
     except Exception as exc:
         log.debug("Operation failed with config=%s", config, exc_info=True)
-        print_error(f"Operation failed: {exc}")
+        print(f"Operation failed: {exc}")
         raise SystemExit(1) from None
 
 
