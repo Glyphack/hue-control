@@ -19,7 +19,7 @@ Make sure to pass the name of your light when controlling it.
 Turn on your light with:
 
 ```bash
-uv run main.py --device "Hue lightstrip" power on
+uvx huec --device "Hue lightstrip" power on
 ```
 
 ## Usage
