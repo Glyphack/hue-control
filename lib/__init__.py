@@ -1,1 +1,0 @@
-"""Hue control library package."""

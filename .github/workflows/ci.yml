@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Sync dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Check README usage section
+        run: |
+          uv run python src/huec/scripts/update_readme_usage.py
+          git diff --exit-code -- README.md
+
+      - name: Run tests
+        run: uv run pytest
+
+      - name: Run pre-commit hooks
+        run: uvx prek run --all-files

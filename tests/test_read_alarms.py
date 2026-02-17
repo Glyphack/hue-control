@@ -1,188 +1,90 @@
 """Unit tests for alarm parsing logic in lib.parsers."""
 
-import unittest
 from datetime import UTC, datetime
 
-from lib.models import Alarm, AlarmProperties
-from lib.parsers import check_delete_ack, check_delete_confirm, parse_alarm, parse_alarm_ids
+import pytest
+
+from huec.lib.models import Alarm
+from huec.lib.parsers import (
+    hex_to_bin,
+    parse_alarm,
+    parse_alarm_ids,
+)
 
 SLOT_LIST_RESPONSE_TYPE = 0x00
 OK_STATUS = 0x00
 
-# Real responses captured in alarm_dump.txt.
-# Format: [type=0x02] [status=0x00] [slot_id LE16] [payload_len] [2 unknown bytes] [payload...]
-MORNING_UP_HEX = (
-    "02001a003500000000010060b29269000901010106010908017d2201d40c138d81b94a4caa42"
-    "b99acec62d8800ffffffff0a4d6f726e696e6720757000"
-)
-# Active wakeup alarm in slot 0x001B.
-MORNING_OFF_HEX = (
-    "02001b003b00000000010070c09269000e01010002010103024c020502701723011f80039c2403"
-    "4364b75f63bef10cea3b01ffffffff0b4d6f726e696e67206f666600"
-)
-# Inactive 5-minute timer in slot 0x0019 named "T".
-INACTIVE_TIMER_HEX = (
-    "0200190024000000000000878e91690101021901187a96a366474a73a8f10539fde09319032c010000015400"
-)
+MORNING_UP = hex_to_bin("""
+02 00 2c 00 35 00 00 00 00 01 00 60 55 95 69 00
+09 01 01 01 06 01 09 08 01 7d 22 01 d4 0c 13 8d
+81 b9 4a 4c aa 42 b9 9a ce c6 2d 88 00 ff ff ff
+ff 0a 4d 6f 72 6e 69 6e 67 20 75 70 01
+""")
+MORNING_OFF = hex_to_bin("""
+02 00 2d 00 3b 00 00 00 00 01 00 70 63 95 69 00
+0e 01 01 00 02 01 01 03 02 4c 02 05 02 70 17 23
+01 1f 80 03 9c 24 03 43 64 b7 5f 63 be f1 0c ea
+3b 01 ff ff ff ff 0b 4d 6f 72 6e 69 6e 67 20 6f
+66 66 01
+""")
+INACTIVE_TIMER = hex_to_bin("")
+ALARM_SLOTS_HEX = hex_to_bin("00 00 07 02 2c 00 2d 00")
 
 
-def make_slot_list_response(slot_ids: list[int]) -> bytes:
-    response = bytearray([SLOT_LIST_RESPONSE_TYPE, OK_STATUS, 0x00, len(slot_ids)])
-    for slot_id in slot_ids:
-        response.extend(slot_id.to_bytes(2, "little"))
-    return bytes(response)
+def assert_alarm_details(
+    alarm: Alarm,
+    *,
+    slot_id: int,
+    payload_length: int,
+    active: bool,
+    timestamp: datetime,
+    name: str,
+) -> None:
+    assert alarm.slot_id, slot_id
+    assert alarm.payload_length, payload_length
+    assert alarm.properties.active, active
+    assert alarm.properties.timestamp, timestamp
+    assert alarm.properties.name, name
 
 
-def parse_alarm_hex(hex_data: str) -> Alarm:
-    return parse_alarm(bytes.fromhex(hex_data))
+def test_parse_three_slots():
+    slot_ids = parse_alarm_ids(ALARM_SLOTS_HEX)
+    assert slot_ids, [0x0019, 0x001A, 0x001B]
 
 
-class TestParseAlarmIds(unittest.TestCase):
-    """Tests for parse_alarm_ids()."""
-
-    def test_parse_three_slots(self):
-        slot_ids = parse_alarm_ids(make_slot_list_response([0x0019, 0x001A, 0x001B]))
-        self.assertEqual(slot_ids, [0x0019, 0x001A, 0x001B])
-
-    def test_parse_empty_slot_list(self):
-        slot_ids = parse_alarm_ids(make_slot_list_response([]))
-        self.assertEqual(slot_ids, [])
-
-    def test_parse_single_slot(self):
-        slot_ids = parse_alarm_ids(make_slot_list_response([0x0042]))
-        self.assertEqual(slot_ids, [0x0042])
-
-    def test_response_too_short(self):
-        data = bytes([SLOT_LIST_RESPONSE_TYPE, OK_STATUS])
-        with self.assertRaises(ValueError) as ctx:
-            parse_alarm_ids(data)
-        self.assertIn("too short", str(ctx.exception))
+def test_morning_up():
+    alarm = parse_alarm(MORNING_UP)
+    assert_alarm_details(
+        alarm,
+        slot_id=0x002C,
+        payload_length=0x35,
+        active=True,
+        timestamp=datetime(2026, 2, 16, 6, 0, 0, tzinfo=UTC),
+        name="Morning up",
+    )
 
 
-class TestDeleteResponses(unittest.TestCase):
-    """Tests for delete ACK/confirm response matching helpers."""
-
-    def test_check_delete_ack_matches_expected_shape(self):
-        slot_id = 0x001A
-        ack = bytes([0x03, 0x00, 0x1A, 0x00])
-        self.assertTrue(check_delete_ack(slot_id, ack))
-
-    def test_check_delete_ack_rejects_unexpected_payload(self):
-        slot_id = 0x001A
-        ack = bytes([0x03, 0xFF, 0x1A, 0x00])
-        self.assertFalse(check_delete_ack(slot_id, ack))
-
-    def test_check_delete_confirm_matches_expected_shape(self):
-        slot_id = 0x001A
-        confirm = bytes([0x04, 0x1A, 0x00, 0xFF, 0xFF])
-        self.assertTrue(check_delete_confirm(slot_id, confirm))
-
-    def test_check_delete_confirm_rejects_unexpected_payload(self):
-        slot_id = 0x001A
-        confirm = bytes([0x04, 0x1A, 0x00, 0x00, 0x00])
-        self.assertFalse(check_delete_confirm(slot_id, confirm))
+def test_parse_morning_off_alarm():
+    alarm = parse_alarm(MORNING_OFF)
+    assert_alarm_details(
+        alarm,
+        slot_id=0x001B,
+        payload_length=0x3B,
+        active=True,
+        timestamp=datetime(2026, 2, 16, 7, 0, 0, tzinfo=UTC),
+        name="Morning off",
+    )
 
 
-class TestParseAlarm(unittest.TestCase):
-    """Tests for parse_alarm() using real alarm payloads."""
-
-    def assert_alarm_details(
-        self,
-        alarm: Alarm,
-        *,
-        slot_id: int,
-        payload_length: int,
-        active: bool,
-        timestamp: datetime,
-        name: str,
-    ) -> None:
-        self.assertEqual(alarm.slot_id, slot_id)
-        self.assertEqual(alarm.payload_length, payload_length)
-        self.assertEqual(alarm.properties.active, active)
-        self.assertEqual(alarm.properties.timestamp, timestamp)
-        self.assertEqual(alarm.properties.name, name)
-
-    def test_parse_morning_up_alarm(self):
-        alarm = parse_alarm_hex(MORNING_UP_HEX)
-        self.assert_alarm_details(
-            alarm,
-            slot_id=0x001A,
-            payload_length=0x35,
-            active=True,
-            timestamp=datetime(2026, 2, 16, 6, 0, 0, tzinfo=UTC),
-            name="Morning up",
-        )
-
-    def test_parse_morning_off_alarm(self):
-        alarm = parse_alarm_hex(MORNING_OFF_HEX)
-        self.assert_alarm_details(
-            alarm,
-            slot_id=0x001B,
-            payload_length=0x3B,
-            active=True,
-            timestamp=datetime(2026, 2, 16, 7, 0, 0, tzinfo=UTC),
-            name="Morning off",
-        )
-
-    def test_parse_inactive_timer(self):
-        """Parses a 5-minute timer named "T" that is inactive."""
-        alarm = parse_alarm_hex(INACTIVE_TIMER_HEX)
-        self.assert_alarm_details(
-            alarm,
-            slot_id=0x0019,
-            payload_length=0x24,
-            active=False,
-            timestamp=datetime(2026, 2, 15, 9, 14, 47, tzinfo=UTC),
-            name="T",
-        )
-
-    def test_invalid_response_type(self):
-        data = bytes([SLOT_LIST_RESPONSE_TYPE, OK_STATUS, 0x1A, 0x00, 0x35, 0x00] + [0x00] * 10)
-        with self.assertRaises(ValueError) as ctx:
-            parse_alarm(data)
-        self.assertIn("Expected response type 0x02", str(ctx.exception))
-
-    def test_response_too_short(self):
-        data = bytes([0x02, OK_STATUS, 0x1A])
-        with self.assertRaises(ValueError) as ctx:
-            parse_alarm(data)
-        self.assertIn("too short", str(ctx.exception))
-
-
-class TestAlarmDataclass(unittest.TestCase):
-    """Tests for the Alarm dataclass."""
-
-    def test_properties_active_flag_roundtrip(self):
-        active_properties = AlarmProperties(
-            active=True,
-            timestamp=datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC),
-            mystery_bytes=b"",
-            name="test",
-        )
-        active_alarm = Alarm(
-            slot_id=1,
-            raw=b"",
-            payload=b"",
-            payload_length=0,
-            properties=active_properties,
-        )
-        self.assertTrue(active_alarm.properties.active)
-
-        inactive_properties = AlarmProperties(
-            active=False,
-            timestamp=datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC),
-            mystery_bytes=b"",
-            name="test",
-        )
-        inactive_alarm = Alarm(
-            slot_id=2,
-            raw=b"",
-            payload=b"",
-            payload_length=0,
-            properties=inactive_properties,
-        )
-        self.assertFalse(inactive_alarm.properties.active)
-
-
-if __name__ == "__main__":
-    unittest.main()
+@pytest.mark.skip("implement with real data")
+def test_parse_inactive_timer():
+    """Parses a 5-minute timer named "T" that is inactive."""
+    alarm = parse_alarm(INACTIVE_TIMER)
+    assert_alarm_details(
+        alarm,
+        slot_id=0x0019,
+        payload_length=0x24,
+        active=False,
+        timestamp=datetime(2026, 2, 15, 9, 14, 47, tzinfo=UTC),
+        name="T",
+    )

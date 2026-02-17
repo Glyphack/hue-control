@@ -4,7 +4,11 @@ Use this via the main CLI:
 `main.py dev set-characteristic --device ... --characteristic ... --data ...`.
 """
 
+import logging
+
 from bleak import BleakClient, BleakScanner
+
+log = logging.getLogger("huec")
 
 
 async def set_characteristic(
@@ -20,5 +24,9 @@ async def set_characteristic(
 
     async with BleakClient(device, timeout=timeout) as client:
         await client.write_gatt_char(characteristic_uuid, data, response=False)
-
-    print(f"Wrote 0x{data.hex()} to {characteristic_uuid} ({device_name}).")
+    log.debug(
+        "set-characteristic write complete device=%s uuid=%s payload=0x%s",
+        device_name,
+        characteristic_uuid,
+        data.hex(),
+    )
