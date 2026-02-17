@@ -3,7 +3,6 @@ name: "Publish"
 on:
   push:
     tags:
-      - "*"
 
 jobs:
   publish:
@@ -35,3 +34,9 @@ jobs:
         run: uv build
       - name: Publish
         run: uv publish
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*
