@@ -19,10 +19,10 @@ jobs:
           ref: main
       - name: Install uv
         uses: astral-sh/setup-uv@v7
-      - name: Install Python 3.13
-        run: uv python install 3.13
       - name: Bump version in pyproject.toml
-        run: uv version "${GITHUB_REF_NAME}"
+        run: |
+          echo ${GITHUB_REF_NAME}
+          uv version "${GITHUB_REF_NAME}"
       - name: Commit version bump
         run: |
           git config user.name "github-actions[bot]"
