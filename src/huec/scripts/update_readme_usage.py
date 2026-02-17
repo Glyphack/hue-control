@@ -10,7 +10,7 @@ from pathlib import Path
 
 from markdown_it import MarkdownIt
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 README_PATH = ROOT / "README.md"
 CLI_PATH = ROOT / "main.py"
 
