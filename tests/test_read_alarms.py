@@ -1,9 +1,10 @@
-"""Unit tests for alarm parsing logic in main.py."""
+"""Unit tests for alarm parsing logic in lib.parsers."""
 
 import unittest
 from datetime import UTC, datetime
 
-from main import Alarm, AlarmProperties, parse_alarm, parse_alarm_ids
+from lib.models import Alarm, AlarmProperties
+from lib.parsers import check_delete_ack, check_delete_confirm, parse_alarm, parse_alarm_ids
 
 SLOT_LIST_RESPONSE_TYPE = 0x00
 OK_STATUS = 0x00
@@ -56,6 +57,30 @@ class TestParseAlarmIds(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             parse_alarm_ids(data)
         self.assertIn("too short", str(ctx.exception))
+
+
+class TestDeleteResponses(unittest.TestCase):
+    """Tests for delete ACK/confirm response matching helpers."""
+
+    def test_check_delete_ack_matches_expected_shape(self):
+        slot_id = 0x001A
+        ack = bytes([0x03, 0x00, 0x1A, 0x00])
+        self.assertTrue(check_delete_ack(slot_id, ack))
+
+    def test_check_delete_ack_rejects_unexpected_payload(self):
+        slot_id = 0x001A
+        ack = bytes([0x03, 0xFF, 0x1A, 0x00])
+        self.assertFalse(check_delete_ack(slot_id, ack))
+
+    def test_check_delete_confirm_matches_expected_shape(self):
+        slot_id = 0x001A
+        confirm = bytes([0x04, 0x1A, 0x00, 0xFF, 0xFF])
+        self.assertTrue(check_delete_confirm(slot_id, confirm))
+
+    def test_check_delete_confirm_rejects_unexpected_payload(self):
+        slot_id = 0x001A
+        confirm = bytes([0x04, 0x1A, 0x00, 0x00, 0x00])
+        self.assertFalse(check_delete_confirm(slot_id, confirm))
 
 
 class TestParseAlarm(unittest.TestCase):
