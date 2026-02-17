@@ -15,8 +15,8 @@ from huec.lib.hue import (
     DEFAULT_DEVICE_NAME,
     HueLight,
 )
-from huec.lib.models import Alarm, Config
-from huec.lib.parsers import format_hex, hex_to_bin
+from huec.lib.models import Config
+from huec.lib.parsers import bin_to_hex, hex_to_bin
 from huec.scripts.subscribe_all import subscribe_all
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
@@ -287,36 +287,6 @@ async def run_interactive(light: HueLight) -> None:
         server.server_close()
 
 
-def print_alarm_report(slots: list[Alarm]) -> None:
-    print("\n" + "=" * 70)
-    print("ALARM DUMP REPORT")
-    print("=" * 70)
-
-    for slot in slots:
-        print(f"\n--- Slot 0x{slot.slot_id:04x} ({slot.slot_id}) ---")
-        print(f"  Raw hex ({len(slot.raw)} bytes):")
-        print(f"    {format_hex(slot.raw)}")
-        print(f"  Payload length: {slot.payload_length}")
-        print(f"  Payload: {format_hex(slot.payload)}")
-        print(f"  Active:         {slot.properties.active}")
-        print(f"  Timestamp:      {slot.properties.timestamp}")
-        print(f"  Name:           '{slot.properties.name}'")
-        print(f"  Mystery bytes:  {format_hex(slot.properties.mystery_bytes)}")
-
-    print("\n" + "=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
-    print(f"{'Slot':>8}  {'Active':>6}  {'Name':<20}  {'Timestamp':<26}")
-    print("-" * 75)
-    for slot in slots:
-        time_str = slot.properties.timestamp.isoformat()
-        active_str = "  YES" if slot.properties.active else "   NO"
-        print(
-            f"  0x{slot.slot_id:04x}  {active_str:>6}  {slot.properties.name:<20}  {time_str:<26}"
-        )
-    print()
-
-
 async def run(args: argparse.Namespace, config: Config) -> None:
     light = await HueLight.connect(config)
     try:
@@ -326,13 +296,6 @@ async def run(args: argparse.Namespace, config: Config) -> None:
 
 
 async def handle_command(args: argparse.Namespace, light: HueLight, config: Config) -> None:
-    log.debug(
-        "Handling command=%s dev_command=%s alarms_command",
-        args.command,
-        getattr(args, "dev_command", None),
-        getattr(args, "alarms_command", None),
-    )
-
     if args.command == "interactive":
         await run_interactive(light)
         return
@@ -350,15 +313,47 @@ async def handle_command(args: argparse.Namespace, light: HueLight, config: Conf
         return
 
     if args.command == "alarms":
+        # Clarify in the docs that alarm ids are not stable and change
         if args.alarms_command == "list":
-            alarms = await light.read_alarms()
-            print_alarm_report(alarms)
+            alarms = await light.get_alarms()
+            for alarm in alarms:
+                log.debug(f"--- ID 0x{alarm._id:04x} ({alarm._id}) ---")
+                log.debug(f"Name:'{alarm.properties.name}'")
+                log.debug(f"Raw hex ({len(alarm.raw)} bytes):")
+                log.debug(f"{bin_to_hex(alarm.raw)}")
+                log.debug(f"Payload length: {alarm.payload_length}")
+                log.debug(f"Payload: {bin_to_hex(alarm.payload)}")
+                log.debug(f"Mystery bytes:  {bin_to_hex(alarm.properties.mystery_bytes)}")
+
+            id_width = 8
+            active_width = 6
+            name_width = 20
+            timestamp_width = 26
+
+            le = id_width + active_width + name_width + timestamp_width + 6
+
+            print("SUMMARY")
+            print("=" * le)
+            print(
+                f"{'ID':>{id_width}}  {'Active':>{active_width}}  {'Name':<{name_width}}  "
+                f"{'Timestamp':<{timestamp_width}}"
+            )
+            print("-" * le)
+            for alarm in alarms:
+                time_str = alarm.properties.timestamp.isoformat()
+                active_str = "YES" if alarm.properties.active else "NO"
+                name_str = alarm.properties.name[:name_width]
+                print(
+                    f"{alarm._id:>{id_width}}  {active_str:>{active_width}}  "
+                    f"{name_str:<{name_width}}  {time_str:<{timestamp_width}}"
+                )
+            print()
         if args.alarms_command == "enable":
-            alarms = await light.read_alarms()
+            alarms = await light.get_alarms()
             if args.all:
                 alarms = [alarm for alarm in alarms if not alarm.properties.active]
             if args.id:
-                alarms = [alarm for alarm in alarms if alarm.slot_id == int(args.id)]
+                alarms = [alarm for alarm in alarms if alarm._id == int(args.id)]
 
             for alarm in alarms:
                 enable_result = await light.enable_alarm(alarm)
@@ -366,11 +361,11 @@ async def handle_command(args: argparse.Namespace, light: HueLight, config: Conf
                     print("Enable alarm failed")
 
         if args.alarms_command == "disable":
-            alarms = await light.read_alarms()
+            alarms = await light.get_alarms()
             if args.all:
                 alarms = [alarm for alarm in alarms if alarm.properties.active]
             if args.id:
-                alarms = [alarm for alarm in alarms if alarm.slot_id == int(args.id)]
+                alarms = [alarm for alarm in alarms if alarm._id == int(args.id)]
 
             for alarm in alarms:
                 disable_result = await light.disable_alarm(alarm)
@@ -378,7 +373,7 @@ async def handle_command(args: argparse.Namespace, light: HueLight, config: Conf
                     print("Disable alarm failed")
 
         if args.alarms_command == "delete":
-            id_result = await light.list_alarm_ids()
+            id_result = await light.get_alarm_ids()
             ids = id_result.slot_ids
             if args.all:
                 pass

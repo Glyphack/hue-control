@@ -40,7 +40,7 @@ def assert_alarm_details(
     timestamp: datetime,
     name: str,
 ) -> None:
-    assert alarm.slot_id, slot_id
+    assert alarm._id, slot_id
     assert alarm.payload_length, payload_length
     assert alarm.properties.active, active
     assert alarm.properties.timestamp, timestamp
