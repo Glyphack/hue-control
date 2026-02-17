@@ -10,9 +10,9 @@ from pathlib import Path
 
 from markdown_it import MarkdownIt
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent.parent
 README_PATH = ROOT / "README.md"
-CLI_PATH = ROOT / "main.py"
+CLI_PATH = ROOT / "src" / "huec" / "main.py"
 
 
 def get_top_level_help() -> str:
