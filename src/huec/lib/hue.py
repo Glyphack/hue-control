@@ -11,6 +11,7 @@ from functools import wraps
 from typing import Any
 
 from bleak import BleakClient, BleakScanner
+from bleak.exc import BleakError
 
 from huec.lib.models import (
     Alarm,
@@ -113,6 +114,19 @@ class HueLight:
         await ins.ensure_timer_notifications_started()
         return ins
 
+    async def reconnect(self) -> None:
+        """Re-establish the BLE connection after it has gone stale."""
+        log.info("Reconnecting to %s (%s)...", self.name, self.address)
+        try:
+            await self.client.disconnect()
+        except Exception:
+            pass
+        self._timer_notifications_started = False
+        self.client = BleakClient(self.address)
+        await self.client.connect()
+        await self.ensure_timer_notifications_started()
+        log.info("Reconnected successfully.")
+
     async def disconnect(self) -> None:
         if not self.client.is_connected:
             return
@@ -153,7 +167,12 @@ class HueLight:
         suffix = f" ({note})" if note else ""
         formatted_hex = " ".join(data.hex()[i : i + 2] for i in range(0, len(data.hex()), 2))
         log.debug("WRITE uuid=%s response=%s data=0x%s%s", uuid, response, formatted_hex, suffix)
-        await self.client.write_gatt_char(uuid, data, response=response)
+        try:
+            await self.client.write_gatt_char(uuid, data, response=response)
+        except BleakError as exc:
+            log.warning("BLE write failed (%s), reconnecting...", exc)
+            await self.reconnect()
+            await self.client.write_gatt_char(uuid, data, response=response)
         log.debug("WRITE complete uuid=%s", uuid)
 
     async def read_power(self) -> bytes:
