@@ -9,10 +9,6 @@ from datetime import UTC, datetime
 from huec.lib.models import (
     Alarm,
     AlarmProperties,
-    SleepCommand,
-    TimerCommand,
-    WakeupCommand,
-    WakeUpMode,
 )
 
 EXPECTED_DELETE_ACK_TYPE = 0x03
@@ -23,12 +19,9 @@ log = logging.getLogger("huec")
 
 def hex_to_bin(value: str) -> bytes:
     cleaned = value.lower().replace("0x", "").replace(" ", "").replace("\n", "")
-    if len(cleaned) % 2:
-        raise SystemExit("Hex payload must have an even number of characters.")
-    try:
-        return bytes.fromhex(cleaned)
-    except ValueError as exc:
-        raise SystemExit(f"Invalid hex payload: {value}.") from exc
+    assert len(cleaned) % 2 == 0, "Hex payload must have an even number of characters."
+    assert all(c in "0123456789abcdef" for c in cleaned), f"Invalid hex payload: {value}."
+    return bytes.fromhex(cleaned)
 
 
 def bin_to_hex(data, width=16):
@@ -57,55 +50,6 @@ def parse_alarm_ids(data: bytes) -> list[int]:
         slot_ids.append(struct.unpack_from("<H", data, offset)[0])
 
     return slot_ids
-
-
-def require_int_range(name: str, value: int, min_value: int, max_value: int) -> int:
-    if not min_value <= value <= max_value:
-        raise SystemExit(f"{name} must be between {min_value} and {max_value}, got {value}.")
-    return value
-
-
-def datetime_to_hex_little_endian(dt: datetime) -> str:
-    timestamp = int(dt.timestamp())
-    packed = struct.pack("<I", timestamp)
-    hex_string = packed.hex().upper()
-    return f"{hex_string[0:4]} {hex_string[4:8]}"
-
-
-def encode_string(text: str) -> str:
-    length = len(text)
-    length_hex = format(length, "02x")
-    text_hex = text.encode("ascii").hex()
-    return length_hex + text_hex
-
-
-def build_wakeup_payload(command: WakeupCommand) -> bytes:
-    if command.mode == WakeUpMode.sunrise:
-        log.debug("Building wakeup payload for time=%s", command.time.isoformat())
-        t = datetime_to_hex_little_endian(command.time)
-        log.debug("Wakeup timestamp payload=%s", t)
-        n = encode_string(command.name)
-        e = "0100" if command.active else "0000"
-        log.debug("Wakeup edit mode=%s", command.edit)
-        c = "0000" if command.edit else "FF00"
-        return hex_to_bin(
-            f"""
-            01FF {c} {e} {t} 0009
-            0101 0106 0109 0801 5B19 0194
-            D184 84B7 5143 DAA8 67A9 2F02
-            110C 8D00 FFFF FFFF {n} 01
-            """
-        )
-
-    raise AssertionError()
-
-
-def build_timer_payload(command: TimerCommand) -> bytes:
-    raise NotImplementedError("Timer payload builder is not implemented yet.")
-
-
-def build_sleep_payload(command: SleepCommand) -> bytes:
-    raise NotImplementedError("Sleep payload builder is not implemented yet.")
 
 
 def parse_alarm(data: bytes) -> Alarm:

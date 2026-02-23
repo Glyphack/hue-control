@@ -1,181 +1,174 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
-<head>
-<meta charset="UTF-8">
-<title>Hue XY Builder</title>
-<style>
-body { font-family: monospace; padding:20px }
-canvas { border:1px solid black; cursor: crosshair }
-</style>
-</head>
-<body>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Hue XY Builder</title>
+    <style>
+      body {
+        font-family: monospace;
+        padding: 20px;
+      }
+      #colorPicker {
+        width: 100px;
+        height: 50px;
+        border: none;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <h3>Hue XY Picker</h3>
 
-<h3>Hue XY Picker</h3>
+    <input type="color" id="colorPicker" value="#ff0000" />
+    <br /><br />
 
-<canvas id="xy" width="300" height="300"></canvas>
-<br><br>
+    Brightness:
+    <input type="range" id="brightness" min="1" max="254" value="254" />
+    <span id="bval">254</span>
 
-Brightness:
-<input type="range" id="brightness" min="1" max="254" value="254">
-<span id="bval">254</span>
+    <br /><br />
 
+    <button onclick="applyPreset('energize')">Energize</button>
+    <button onclick="applyPreset('read')">Read</button>
+    <button onclick="applyPreset('santorini')">Santorini</button>
+    <button onclick="applyPreset('amsterdam')">Amsterdam</button>
 
+    <br /><br />
+    <button onclick="sendPower(false)">Power OFF</button>
 
-<br><br>
+    <br /><br />
 
-<button onclick="applyPreset('energize')">Energize</button>
-<button onclick="applyPreset('read')">Read</button>
-<button onclick="applyPreset('santorini')">Santorini</button>
+    <textarea id="output" rows="4" cols="90"></textarea>
+    <br /><br />
+    <button onclick="copyToClipboard()">Copy DATA</button>
+    <span id="copyStatus"></span>
 
-<br><br>
-<button onclick="sendPower(false)">Power OFF</button>
+    <script>
+      const colorPicker = document.getElementById("colorPicker");
+      const brightnessSlider = document.getElementById("brightness");
+      const colorValue = document.getElementById("output");
+      const brightnessValue = document.getElementById("bval");
 
-<br><br>
+      const PRESETS = {
+        energize: [0x01, 0x01, 0x01, 0x02, 0x01, 0xfe, 0x03, 0x02, 0x9c, 0x00],
+        read: [0x01, 0x01, 0x01, 0x02, 0x01, 0xfe, 0x03, 0x02, 0x5a, 0x01],
+        santorini: [
+          0x01, 0x01, 0x01, 0x02, 0x01, 0xca, 0x04, 0x04, 0x77, 0x77, 0x37,
+          0x4b, 0x07, 0x13, 0x50, 0x00, 0x00, 0x00, 0x4f, 0x15, 0x54, 0x61,
+          0x97, 0x6a, 0xe4, 0x87, 0x70, 0x9f, 0x88, 0x73, 0x29, 0x3a, 0x59,
+          0x08, 0x01, 0xa0,
+        ],
+        amsterdam: [
+          0x01, 0x01, 0x01, 0x02, 0x01, 0xca, 0x04, 0x04, 0x1e, 0x85, 0x85,
+          0x6b, 0x07, 0x13, 0x50, 0x00, 0x00, 0x00, 0xf6, 0x28, 0x7b, 0x14,
+          0x7a, 0x94, 0x8b, 0x54, 0xa2, 0x75, 0xa3, 0x70, 0x29, 0x3a, 0x59,
+          0x08, 0x01, 0xa0,
+        ],
+      };
 
-<textarea id="output" rows="4" cols="90"></textarea>
-<br><br>
-<button onclick="copyToClipboard()">Copy DATA</button>
-<span id="copyStatus"></span>
+      let currentX = 0;
+      let currentY = 0;
 
+      // Hex color string to Hue CIE xy (Wide RGB D65 matrix)
+      function updateXyFromColor(hex) {
+        let r = parseInt(hex.substring(1, 3), 16) / 255;
+        let g = parseInt(hex.substring(3, 5), 16) / 255;
+        let b = parseInt(hex.substring(5, 7), 16) / 255;
+        r = r > 0.04045 ? Math.pow((r + 0.055) / 1.055, 2.4) : r / 12.92;
+        g = g > 0.04045 ? Math.pow((g + 0.055) / 1.055, 2.4) : g / 12.92;
+        b = b > 0.04045 ? Math.pow((b + 0.055) / 1.055, 2.4) : b / 12.92;
+        const X = r * 0.664511 + g * 0.154324 + b * 0.162028;
+        const Y = r * 0.283881 + g * 0.668433 + b * 0.047685;
+        const Z = r * 0.000088 + g * 0.07231 + b * 0.986039;
+        const sum = X + Y + Z;
+        const cx = sum === 0 ? 0.3127 : X / sum;
+        const cy = sum === 0 ? 0.329 : Y / sum;
+        currentX = Math.round(cx * 65535);
+        currentY = Math.round(cy * 65535);
+      }
 
+      function buildPacket(x16, y16, brightness) {
+        return [
+          0x01,
+          0x01,
+          0x01,
+          0x02,
+          0x01,
+          brightness,
+          0x04,
+          0x04,
+          x16 & 0xff,
+          (x16 >> 8) & 0xff,
+          y16 & 0xff,
+          (y16 >> 8) & 0xff,
+        ];
+      }
 
-<script>
-const canvas = document.getElementById("xy");
-const ctx = canvas.getContext("2d");
-const brightnessSlider = document.getElementById("brightness");
-const output = document.getElementById("output");
-const bval = document.getElementById("bval");
+      function updatePacket() {
+        const brightness = parseInt(brightnessSlider.value);
+        brightnessValue.textContent = brightness;
+        sendColor(buildPacket(currentX, currentY, brightness));
+      }
 
+      function applyPreset(name) {
+        const brightness = parseInt(brightnessSlider.value);
+        brightnessValue.textContent = brightness;
 
-const PRESETS = {
-    energize: [
-        0x01,0x01,0x01,0x02,0x01,0xFE,0x03,0x02,0x9C,0x00
-    ],
-    read: [
-        0x01,0x01,0x01,0x02,0x01,0xFE,0x03,0x02,0x5a,0x01
-    ],
-    santorini: [
-        0x01,0x01,0x01,0x02,0x01,0xCA,0x04,0x04,
-        0x77,0x77,0x37,0x4B,0x07,0x13,0x50,0x00,
-        0x00,0x00,0x4F,0x15,0x54,0x61,0x97,0x6A,
-        0xE4,0x87,0x70,0x9F,0x88,0x73,0x29,0x3A,
-        0x59,0x08,0x01,0xA0
-    ]
-};
+        // Clone preset
+        const data = [...PRESETS[name]];
 
+        // Replace brightness byte (index 5)
+        data[5] = brightness;
 
+        sendColor(data);
+      }
 
+      function sendColor(data) {
+        const hexString = data
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("");
 
-let currentX = 32768;
-let currentY = 32768;
+        fetch(`http://localhost:8000/send?data=${hexString}`).then(() =>
+          console.log("Sent to BLE"),
+        );
 
-// Draw XY gradient
-for(let x=0; x<300; x++){
-    for(let y=0; y<300; y++){
-        ctx.fillStyle = `rgb(${x}, ${y}, ${255-y})`;
-        ctx.fillRect(x,y,1,1);
-    }
-}
+        colorValue.value = hexString;
+      }
 
-function buildPacket(x16, y16, brightness){
-    return [
-        0x01,0x01,0x01,0x02,0x01,brightness,
-        0x04,0x04,
-        x16 & 0xFF, (x16 >> 8) & 0xFF,
-        y16 & 0xFF, (y16 >> 8) & 0xFF,
-    ];
-}
+      brightnessSlider.addEventListener("input", updatePacket);
 
-function updatePacket(){
-    const brightness = parseInt(brightnessSlider.value);
-    bval.textContent = brightness;
+      function onColorChange(e) {
+        localStorage.setItem("hueColor", e.target.value);
+        console.log(e.target.value);
+        updateXyFromColor(e.target.value);
+        updatePacket();
+      }
 
-    const data = buildPacket(currentX, currentY, brightness);
+      colorPicker.addEventListener("input", onColorChange);
+      colorPicker.addEventListener("change", onColorChange);
 
-    // Convert to hex string
-    const hexString = data.map(b =>
-        b.toString(16).padStart(2,"0")
-    ).join("");
+      function copyToClipboard() {
+        const text = document.getElementById("output").value;
 
-    // Auto send to python server
-    //fetch(`http://localhost:8000/send?data=${hexString}`)
-    //    .then(()=>console.log("Sent to BLE"));
-
-    //output.value = hexString;
-    sendToPython(data);
-
-}
-
-function applyPreset(name) {
-    const brightness = parseInt(brightnessSlider.value);
-    bval.textContent = brightness;
-
-    // Clone preset
-    const data = [...PRESETS[name]];
-
-    // Replace brightness byte (index 5)
-    data[5] = brightness;
-
-    sendToPython(data);
-}
-
-function sendToPython(data) {
-    const hexString = data.map(b =>
-        b.toString(16).padStart(2,"0")
-    ).join("");
-
-    fetch(`http://localhost:8000/send?data=${hexString}`)
-        .then(()=>console.log("Sent to BLE"));
-
-    output.value = hexString;
-}
-
-
-brightnessSlider.addEventListener("input", updatePacket);
-
-// Canvas click updates XY AND rebuilds packet
-canvas.addEventListener("click", e=>{
-    const rect = canvas.getBoundingClientRect();
-    const px = e.clientX - rect.left;
-    const py = e.clientY - rect.top;
-
-    currentX = Math.floor((px/300) * 65535);
-    currentY = Math.floor((py/300) * 65535);
-
-    updatePacket();
-});
-
-function copyToClipboard(){
-    const text = document.getElementById("output").value;
-
-    navigator.clipboard.writeText(text).then(()=>{
-        document.getElementById("copyStatus").textContent = " ✔ Copied!";
-        setTimeout(()=>{
+        navigator.clipboard.writeText(text).then(() => {
+          document.getElementById("copyStatus").textContent = " ✔ Copied!";
+          setTimeout(() => {
             document.getElementById("copyStatus").textContent = "";
-        },1000);
-    });
-}
+          }, 1000);
+        });
+      }
 
+      function sendPower(state) {
+        fetch(`http://localhost:8000/power?state=${state ? "on" : "off"}`).then(
+          () => console.log("Power command sent"),
+        );
+      }
 
-function sendPower(state) {
-    fetch(`http://localhost:8000/power?state=${state ? "on" : "off"}`)
-        .then(()=>console.log("Power command sent"));
-}
-
-
-
-// Initialize once
-updatePacket();
-</script>
-
-
-
-
-
-
-
-
-
-</body>
+      // Initialize from saved color or default
+      const savedColor = localStorage.getItem("hueColor");
+      if (savedColor) colorPicker.value = savedColor;
+      updateXyFromColor(colorPicker.value);
+      updatePacket();
+    </script>
+  </body>
 </html>
-

@@ -11,6 +11,7 @@ from functools import wraps
 from typing import Any
 
 from bleak import BleakClient, BleakScanner
+from bleak.exc import BleakError
 
 from huec.lib.models import (
     Alarm,
@@ -113,6 +114,19 @@ class HueLight:
         await ins.ensure_timer_notifications_started()
         return ins
 
+    async def reconnect(self) -> None:
+        """Re-establish the BLE connection after it has gone stale."""
+        log.info("Reconnecting to %s (%s)...", self.name, self.address)
+        try:
+            await self.client.disconnect()
+        except Exception:
+            pass
+        self._timer_notifications_started = False
+        self.client = BleakClient(self.address)
+        await self.client.connect()
+        await self.ensure_timer_notifications_started()
+        log.info("Reconnected successfully.")
+
     async def disconnect(self) -> None:
         if not self.client.is_connected:
             return
@@ -153,7 +167,12 @@ class HueLight:
         suffix = f" ({note})" if note else ""
         formatted_hex = " ".join(data.hex()[i : i + 2] for i in range(0, len(data.hex()), 2))
         log.debug("WRITE uuid=%s response=%s data=0x%s%s", uuid, response, formatted_hex, suffix)
-        await self.client.write_gatt_char(uuid, data, response=response)
+        try:
+            await self.client.write_gatt_char(uuid, data, response=response)
+        except BleakError as exc:
+            log.warning("BLE write failed (%s), reconnecting...", exc)
+            await self.reconnect()
+            await self.client.write_gatt_char(uuid, data, response=response)
         log.debug("WRITE complete uuid=%s", uuid)
 
     async def read_power(self) -> bytes:
@@ -236,7 +255,7 @@ class HueLight:
         response = await self.next_timer_notification()
         return parse_alarm(response)
 
-    async def _send_enable_alarm(
+    async def _send_alarm_command(
         self,
         alarm: Alarm,
         msg: bytes,
@@ -269,33 +288,11 @@ class HueLight:
 
     async def enable_alarm(self, alarm: Alarm) -> AlarmEnableResult:
         msg = build_enable_alarm_command(alarm)
-        return await self._send_enable_alarm(alarm, msg, note="Enabling timer")
+        return await self._send_alarm_command(alarm, msg, note="Enabling timer")
 
     async def disable_alarm(self, alarm: Alarm) -> AlarmEnableResult:
         msg = build_disable_alarm_command(alarm)
-        await self.write_characteristic(TIMER_UUID, msg, note="Disabling Alarm", response=False)
-
-        ack = b""
-        ack_ok = False
-        confirm = b""
-        confirm_ok = False
-        try:
-            ack = await self.next_timer_notification()
-            if len(ack) >= 2 and ack[0] == 0x01 and ack[1] == 0x00:
-                ack_ok = True
-        except TimeoutError:
-            ack_ok = False
-
-        try:
-            confirm = await self.next_timer_notification()
-            confirm_ok = True
-            # TODO: Validate confirm
-        except TimeoutError:
-            confirm_ok = False
-
-        return AlarmEnableResult(
-            slot_id=alarm._id, ack=ack, ack_ok=ack_ok, confirm=confirm, confirm_ok=confirm_ok
-        )
+        return await self._send_alarm_command(alarm, msg, note="Disabling Alarm")
 
     async def delete_alarm(self, a_id: int) -> AlarmDeleteResult:
         lo = a_id & 0xFF
