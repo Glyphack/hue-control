@@ -23,7 +23,7 @@
     <br /><br />
 
     Brightness:
-    <input type="range" id="brightness" min="1" max="254" value="254" />
+    <input type="range" id="brightness" min="0" max="254" value="254" />
     <span id="bval">254</span>
 
     <br /><br />
@@ -104,10 +104,36 @@
         ];
       }
 
-      function updatePacket() {
+      function parseHexPacket(value) {
+        const cleaned = value.toLowerCase().replace(/0x/g, "").replace(/\s+/g, "");
+        if (!cleaned || cleaned.length % 2 !== 0) return null;
+        if (!/^[0-9a-f]+$/.test(cleaned)) return null;
+
+        const data = [];
+        for (let i = 0; i < cleaned.length; i += 2) {
+          data.push(parseInt(cleaned.slice(i, i + 2), 16));
+        }
+        return data;
+      }
+
+      function updatePacketFromColor() {
         const brightness = parseInt(brightnessSlider.value);
         brightnessValue.textContent = brightness;
         sendColor(buildPacket(currentX, currentY, brightness));
+      }
+
+      function updatePacketBrightnessOnly() {
+        const brightness = parseInt(brightnessSlider.value);
+        brightnessValue.textContent = brightness;
+
+        const dataFromPage = parseHexPacket(colorValue.value);
+        const data =
+          dataFromPage && dataFromPage.length > 5
+            ? dataFromPage
+            : buildPacket(currentX, currentY, brightness);
+        data[5] = brightness;
+
+        sendColor(data);
       }
 
       function applyPreset(name) {
@@ -135,13 +161,13 @@
         colorValue.value = hexString;
       }
 
-      brightnessSlider.addEventListener("input", updatePacket);
+      brightnessSlider.addEventListener("input", updatePacketBrightnessOnly);
 
       function onColorChange(e) {
         localStorage.setItem("hueColor", e.target.value);
         console.log(e.target.value);
         updateXyFromColor(e.target.value);
-        updatePacket();
+        updatePacketFromColor();
       }
 
       colorPicker.addEventListener("input", onColorChange);
@@ -168,7 +194,7 @@
       const savedColor = localStorage.getItem("hueColor");
       if (savedColor) colorPicker.value = savedColor;
       updateXyFromColor(colorPicker.value);
-      updatePacket();
+      updatePacketFromColor();
     </script>
   </body>
 </html>

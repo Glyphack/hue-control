@@ -27,15 +27,17 @@ uvx huec --device "Hue lightstrip" power on
 ```text
 uvx huec --help
 usage: main.py [-h] [--debug] [-d DEVICE] [--timeout TIMEOUT]
-               {interactive,power,color,alarms,dev} ...
+               {interactive,power,color,brightness,alarms,dev} ...
 
 Control Hue lightstrip over BLE.
 
 positional arguments:
-  {interactive,power,color,alarms,dev}
+  {interactive,power,color,brightness,alarms,dev}
     interactive         Start HTTP server and keep BLE connection open.
     power               Turn the light on or off.
     color               Control color and brightness
+    brightness          Read or set brightness while preserving the current
+                        color payload.
     alarms              Control alarms(routines) to turn the light on/off
                         automatically.
     dev                 Developer utilities.
