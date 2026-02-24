@@ -175,11 +175,22 @@ class HueLight:
             await self.client.write_gatt_char(uuid, data, response=response)
         log.debug("WRITE complete uuid=%s", uuid)
 
-    async def read_power(self) -> bytes:
-        readback = await self.client.read_gatt_char(POWER_UUID)
+    async def read_characteristic(self, uuid: str) -> bytes:
+        try:
+            readback = await self.client.read_gatt_char(uuid)
+        except BleakError as exc:
+            log.warning("BLE read failed (%s), reconnecting...", exc)
+            await self.reconnect()
+            readback = await self.client.read_gatt_char(uuid)
         readback_bytes = bytes(readback)
-        log.debug("READ uuid=%s data=0x%s", POWER_UUID, readback_bytes.hex())
+        log.debug("READ uuid=%s data=0x%s", uuid, readback_bytes.hex())
         return readback_bytes
+
+    async def read_power(self) -> bytes:
+        return await self.read_characteristic(POWER_UUID)
+
+    async def read_color(self) -> bytes:
+        return await self.read_characteristic(COLOR_UUID)
 
     @retry_async(attempts=20, delay_seconds=0.3, operation="Setting power")
     async def set_power(self, on: bool) -> None:

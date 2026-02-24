@@ -6,13 +6,18 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from huec.lib.hue import (
+    COLOR_UUID,
     DEFAULT_DEVICE_NAME,
+    POWER_UUID,
+    RGB_UUID,
+    TIMER_UUID,
     HueLight,
 )
 from huec.lib.models import Config
@@ -21,6 +26,59 @@ from huec.scripts.subscribe_all import subscribe_all
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 log = logging.getLogger("huec")
+BRIGHTNESS_BYTE_INDEX = 5
+MAX_BRIGHTNESS = 254
+KNOWN_CHARACTERISTIC_UUIDS = {
+    "power": POWER_UUID,
+    "rgb": RGB_UUID,
+    "color": COLOR_UUID,
+    "timer": TIMER_UUID,
+    "light-change-response": "932c32bd-0003-47a2-835a-a8d455b859dd",
+}
+KNOWN_CHARACTERISTIC_CHOICES = tuple(sorted(KNOWN_CHARACTERISTIC_UUIDS.keys()))
+UUID_REGEX = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def normalize_characteristic_name(value: str) -> str:
+    return value.strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def parse_characteristic_uuid(value: str) -> str:
+    raw = value.strip()
+    if UUID_REGEX.fullmatch(raw):
+        return raw.lower()
+    raise argparse.ArgumentTypeError(f"Invalid characteristic UUID: {value}")
+
+
+def resolve_characteristic_name(value: str) -> str:
+    return KNOWN_CHARACTERISTIC_UUIDS[normalize_characteristic_name(value)]
+
+
+def parse_brightness_value(value: str) -> int:
+    try:
+        brightness = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Brightness must be an integer between 0 and 254."
+        ) from exc
+
+    if not 0 <= brightness <= MAX_BRIGHTNESS:
+        raise argparse.ArgumentTypeError("Brightness must be between 0 and 254.")
+    return brightness
+
+
+def set_payload_brightness(payload: bytes, brightness: int) -> bytes:
+    if len(payload) <= BRIGHTNESS_BYTE_INDEX:
+        raise ValueError(
+            f"Color payload too short ({len(payload)} bytes); expected at least "
+            f"{BRIGHTNESS_BYTE_INDEX + 1} bytes."
+        )
+
+    updated = bytearray(payload)
+    updated[BRIGHTNESS_BYTE_INDEX] = brightness
+    return bytes(updated)
 
 
 def configure_logging(debug: bool) -> None:
@@ -63,6 +121,25 @@ def build_args() -> argparse.ArgumentParser:
         required=True,
         help="""Raw hex payload in the same format.
  To obtain the value use interactive command and use the color picker.""",
+    )
+
+    brightness = subparsers.add_parser(
+        "brightness",
+        help="Read or set brightness while preserving the current color payload.",
+    )
+    brightness_subparsers = brightness.add_subparsers(dest="brightness_command", required=True)
+    brightness_subparsers.add_parser(
+        "show",
+        help="Show brightness as an integer (0-254).",
+    )
+    brightness_set = brightness_subparsers.add_parser(
+        "set",
+        help="Set brightness (0-254) while keeping the current color payload.",
+    )
+    brightness_set.add_argument(
+        "value",
+        type=parse_brightness_value,
+        help="Brightness integer in range 0..254.",
     )
 
     alarms = subparsers.add_parser(
@@ -170,16 +247,63 @@ def build_args() -> argparse.ArgumentParser:
         "set-characteristic",
         help="Send raw hex data to a characteristic.",
     )
-    dev_set.add_argument(
+    dev_set_target = dev_set.add_mutually_exclusive_group(required=True)
+    dev_set_target.add_argument(
         "--characteristic",
-        required=True,
-        help="Characteristic UUID to write.",
+        metavar="UUID",
+        type=parse_characteristic_uuid,
+        help="Characteristic UUID.",
+    )
+    dev_set_target.add_argument(
+        "--characteristic-name",
+        type=normalize_characteristic_name,
+        choices=KNOWN_CHARACTERISTIC_CHOICES,
+        help="Known characteristic name.",
     )
     dev_set.add_argument(
         "--data",
         required=True,
         help="Hex payload (e.g. '01ff 02').",
     )
+
+    dev_read = dev_subparsers.add_parser(
+        "read-characteristic",
+        help="Read a characteristic value and print it as hex.",
+    )
+    dev_read_target = dev_read.add_mutually_exclusive_group(required=True)
+    dev_read_target.add_argument(
+        "--characteristic",
+        metavar="UUID",
+        type=parse_characteristic_uuid,
+        help="Characteristic UUID.",
+    )
+    dev_read_target.add_argument(
+        "--characteristic-name",
+        type=normalize_characteristic_name,
+        choices=KNOWN_CHARACTERISTIC_CHOICES,
+        help="Known characteristic name.",
+    )
+
+    dev_subscribe = dev_subparsers.add_parser(
+        "subscribe-characteristic",
+        help="Subscribe to characteristic notifications and print payloads as hex.",
+    )
+    dev_subscribe_target = dev_subscribe.add_mutually_exclusive_group(required=True)
+    dev_subscribe_target.add_argument(
+        "--characteristic",
+        metavar="UUID",
+        nargs="+",
+        type=parse_characteristic_uuid,
+        help="One or more characteristic UUIDs.",
+    )
+    dev_subscribe_target.add_argument(
+        "--characteristic-name",
+        nargs="+",
+        type=normalize_characteristic_name,
+        choices=KNOWN_CHARACTERISTIC_CHOICES,
+        help="One or more known characteristic names.",
+    )
+    dev_subscribe.set_defaults(dev_command="subscribe-characteristic")
 
     dev_subparsers.add_parser(
         "subscribe-all",
@@ -302,6 +426,28 @@ async def handle_command(args: argparse.Namespace, light: HueLight, config: Conf
         await light.set_color(data)
         return
 
+    if args.command == "brightness":
+        if args.brightness_command == "show":
+            color_payload = await light.read_color()
+            if len(color_payload) <= BRIGHTNESS_BYTE_INDEX:
+                raise SystemExit(
+                    f"Color payload too short ({len(color_payload)} bytes); expected at least "
+                    f"{BRIGHTNESS_BYTE_INDEX + 1} bytes."
+                )
+            print(color_payload[BRIGHTNESS_BYTE_INDEX])
+            return
+
+        if args.brightness_command == "set":
+            if args.value is None:
+                raise SystemExit("Brightness value is required.")
+            color_payload = await light.read_color()
+            try:
+                updated_payload = set_payload_brightness(color_payload, args.value)
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+            await light.set_color(updated_payload)
+            return
+
     if args.command == "alarms":
         # Clarify in the docs that alarm ids are not stable and change
         if args.alarms_command == "list":
@@ -389,7 +535,71 @@ async def handle_command(args: argparse.Namespace, light: HueLight, config: Conf
 async def handle_dev(args: argparse.Namespace, light: HueLight, config: Config) -> None:
     if args.dev_command == "set-characteristic":
         payload = hex_to_bin(args.data)
-        await light.write_characteristic(args.characteristic, payload, response=True)
+        if args.characteristic is not None:
+            characteristic_uuid = args.characteristic
+        else:
+            characteristic_uuid = resolve_characteristic_name(args.characteristic_name)
+        await light.write_characteristic(characteristic_uuid, payload, response=True)
+        return
+
+    if args.dev_command == "read-characteristic":
+        if args.characteristic is not None:
+            characteristic_uuid = args.characteristic
+        else:
+            characteristic_uuid = resolve_characteristic_name(args.characteristic_name)
+        payload = await light.read_characteristic(characteristic_uuid)
+        print(payload.hex())
+        return
+
+    if args.dev_command == "subscribe-characteristic":
+        targets: list[tuple[str, str]] = []
+        if args.characteristic_name:
+            selected_names = list(dict.fromkeys(args.characteristic_name))
+            targets.extend((name, resolve_characteristic_name(name)) for name in selected_names)
+        if args.characteristic:
+            selected_uuids = list(dict.fromkeys(args.characteristic))
+            targets.extend((uuid, uuid) for uuid in selected_uuids)
+
+        joined = ", ".join(f"{label} ({uuid})" for label, uuid in targets)
+        print(f"Listening on {joined}... (Ctrl+C to stop)")
+
+        timer_task: asyncio.Task[None] | None = None
+        subscribed_targets: list[tuple[str, str]] = []
+
+        timer_target = next(((label, uuid) for label, uuid in targets if uuid == TIMER_UUID), None)
+        if timer_target is not None:
+            timer_label, timer_uuid = timer_target
+
+            async def timer_listener() -> None:
+                while True:
+                    payload = await light.next_timer_notification()
+                    print(f"{timer_label} ({timer_uuid}) {payload.hex()}")
+
+            timer_task = asyncio.create_task(timer_listener())
+
+        for label, characteristic_uuid in targets:
+            if characteristic_uuid == TIMER_UUID:
+                continue
+
+            def on_notification(
+                _,
+                data: bytearray,
+                *,
+                _label: str = label,
+                _uuid: str = characteristic_uuid,
+            ) -> None:
+                print(f"{_label} ({_uuid}) {bytes(data).hex()}")
+
+            await light.client.start_notify(characteristic_uuid, on_notification)
+            subscribed_targets.append((label, characteristic_uuid))
+        try:
+            await asyncio.Event().wait()
+        finally:
+            if timer_task is not None:
+                timer_task.cancel()
+                await asyncio.gather(timer_task, return_exceptions=True)
+            for _, characteristic_uuid in subscribed_targets:
+                await light.client.stop_notify(characteristic_uuid)
         return
 
     if args.dev_command == "subscribe-all":
