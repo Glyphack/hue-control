@@ -149,7 +149,13 @@ def build_args() -> argparse.ArgumentParser:
     )
     alarms_subparsers = alarms.add_subparsers(dest="alarms_command", required=True)
 
-    alarms_subparsers.add_parser("list", help="List alarms.")
+    alarms_list = alarms_subparsers.add_parser("list", help="List alarms.")
+    alarms_list.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Output alarms as JSON.",
+    )
 
     alarms_enable = alarms_subparsers.add_parser("enable", help="Enable alarms.")
     alarms_enable_target = alarms_enable.add_mutually_exclusive_group(required=True)
@@ -462,37 +468,53 @@ async def handle_command(args: argparse.Namespace, light: HueLight, config: Conf
                 log.debug(f"Payload: {bin_to_hex(alarm.payload)}")
                 log.debug(f"Mystery bytes:  {bin_to_hex(alarm.properties.mystery_bytes)}")
 
-            id_width = 8
-            active_width = 6
-            name_width = 20
-            summary_rows = []
-            for alarm in alarms:
-                time_str = alarm.properties.timestamp.isoformat()
-                if not alarm.is_wake_up_or_sleep():
-                    duration = alarm.extract_timer_duration_seconds()
-                    time_str = f"{time_str} ({duration}s)"
-                active_str = "YES" if alarm.properties.active else "NO"
-                name_str = alarm.properties.name[:name_width]
-                summary_rows.append((alarm._id, active_str, name_str, time_str))
+            if args.json_output:
+                import json
 
-            timestamp_width = 26
-            if summary_rows:
-                timestamp_width = max(timestamp_width, max(len(row[3]) for row in summary_rows))
+                result = []
+                for alarm in alarms:
+                    entry = {
+                        "id": alarm._id,
+                        "active": alarm.properties.active,
+                        "name": alarm.properties.name,
+                        "timestamp": alarm.properties.timestamp.isoformat(),
+                    }
+                    if not alarm.is_wake_up_or_sleep():
+                        entry["duration_seconds"] = alarm.extract_timer_duration_seconds()
+                    result.append(entry)
+                print(json.dumps(result, indent=2))
+            else:
+                id_width = 8
+                active_width = 6
+                name_width = 20
+                summary_rows = []
+                for alarm in alarms:
+                    time_str = alarm.properties.timestamp.isoformat()
+                    if not alarm.is_wake_up_or_sleep():
+                        duration = alarm.extract_timer_duration_seconds()
+                        time_str = f"{time_str} ({duration}s)"
+                    active_str = "YES" if alarm.properties.active else "NO"
+                    name_str = alarm.properties.name[:name_width]
+                    summary_rows.append((alarm._id, active_str, name_str, time_str))
 
-            le = id_width + active_width + name_width + timestamp_width + 6
+                timestamp_width = 26
+                if summary_rows:
+                    timestamp_width = max(timestamp_width, max(len(row[3]) for row in summary_rows))
 
-            print("SUMMARY")
-            print("=" * le)
-            print(
-                f"{'ID':>{id_width}}  {'Active':>{active_width}}  {'Name':<{name_width}}  "
-                f"{'Timestamp':<{timestamp_width}}"
-            )
-            print("-" * le)
-            for alarm_id, active_str, name_str, time_str in summary_rows:
+                le = id_width + active_width + name_width + timestamp_width + 6
+
+                print("SUMMARY")
+                print("=" * le)
                 print(
-                    f"{alarm_id:>{id_width}}  {active_str:>{active_width}}  "
-                    f"{name_str:<{name_width}}  {time_str:<{timestamp_width}}"
+                    f"{'ID':>{id_width}}  {'Active':>{active_width}}  {'Name':<{name_width}}  "
+                    f"{'Timestamp':<{timestamp_width}}"
                 )
+                print("-" * le)
+                for alarm_id, active_str, name_str, time_str in summary_rows:
+                    print(
+                        f"{alarm_id:>{id_width}}  {active_str:>{active_width}}  "
+                        f"{name_str:<{name_width}}  {time_str:<{timestamp_width}}"
+                    )
         if args.alarms_command == "enable":
             alarms = await light.get_alarms()
             if args.all:
