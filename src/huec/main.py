@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.resources
 import logging
 import os
 import re
@@ -328,8 +329,8 @@ async def run_interactive(light: HueLight) -> None:
                 self.send_header("Content-type", "text/html")
                 self.end_headers()
 
-                with open("auto_color.html", "rb") as f:
-                    self.wfile.write(f.read())
+                html = importlib.resources.files("huec").joinpath("auto_color.html").read_bytes()
+                self.wfile.write(html)
                 return
 
             if parsed.path == "/power":

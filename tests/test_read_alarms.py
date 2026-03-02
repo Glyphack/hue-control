@@ -11,9 +11,6 @@ from huec.lib.parsers import (
     parse_alarm_ids,
 )
 
-SLOT_LIST_RESPONSE_TYPE = 0x00
-OK_STATUS = 0x00
-
 MORNING_UP = hex_to_bin("""
 02 00 2c 00 35 00 00 00 00 01 00 60 55 95 69 00
 09 01 01 01 06 01 09 08 01 7d 22 01 d4 0c 13 8d
