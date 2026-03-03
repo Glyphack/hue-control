@@ -131,7 +131,10 @@ class HueLight:
         if not self.client.is_connected:
             return
 
-        await self.stop_timer_notifications()
+        try:
+            await self.stop_timer_notifications()
+        except BleakError as exc:
+            log.debug("Ignoring error stopping timer notifications during disconnect: %s", exc)
         await self.client.disconnect()
 
     def _on_timer_notification(self, _, data: bytearray) -> None:
