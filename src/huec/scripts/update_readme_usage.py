@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Update README Usage section from top-level CLI help."""
-
 from __future__ import annotations
 
 import os

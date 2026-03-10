@@ -1,13 +1,14 @@
-"""Hue BLE control primitives."""
-
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import sys
 from collections.abc import Awaitable, Callable, Coroutine
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import wraps
+from pathlib import Path
 from typing import Any
 
 from bleak import BleakClient, BleakScanner
@@ -30,7 +31,45 @@ from huec.lib.parsers import (
     parse_alarm_ids,
 )
 
+CONFIG_PATH = Path.home() / ".config"
+if xdg := os.environ.get("XDG_CONFIG_HOME"):
+    CONFIG_PATH = Path(xdg)
+
+CONFIG_PATH = CONFIG_PATH / "huec.json"
+
 DEFAULT_DEVICE_NAME = "Hue lightstrip plus"
+
+
+@dataclass
+class HuecConfig:
+    default_device: str = DEFAULT_DEVICE_NAME
+    device_addresses: dict[str, str] = field(default_factory=dict)
+
+    def get_config_path(self):
+        home_str = str(Path.home())
+        p_str = str(CONFIG_PATH)
+        if p_str.startswith(home_str):
+            return "~" + p_str[len(home_str) :]
+        return p_str
+
+    @classmethod
+    def load(cls) -> HuecConfig:
+        try:
+            data = json.loads(CONFIG_PATH.read_text())
+            return cls(
+                default_device=data.get("default_device", DEFAULT_DEVICE_NAME),
+                device_addresses=data.get("device_addresses", {}),
+            )
+        except Exception:
+            config = cls()
+            config.save()
+            return config
+
+    def save(self) -> None:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(asdict(self), indent=2) + "\n")
+
+
 POWER_UUID = "932c32bd-0002-47a2-835a-a8d455b859dd"
 COLOR_UUID = "932c32bd-0007-47a2-835a-a8d455b859dd"
 RGB_UUID = "932c32bd-0005-47a2-835a-a8d455b859dd"
@@ -42,7 +81,7 @@ log = logging.getLogger("huec")
 
 
 class PowerStateMismatchError(RuntimeError):
-    """Raised when power readback does not match desired state."""
+    pass
 
 
 def retry_async(
@@ -51,7 +90,6 @@ def retry_async(
     delay_seconds: float,
     operation: str,
 ) -> Callable[[Callable[..., Awaitable[None]]], Callable[..., Coroutine[Any, Any, None]]]:
-    """Retry async operations that raise exceptions."""
     if attempts < 1:
         raise ValueError("attempts must be >= 1")
 
@@ -96,7 +134,29 @@ class HueLight:
     _timer_notifications_started: bool = field(default=False, init=False, repr=False)
 
     @classmethod
-    async def connect(cls, config: Config) -> HueLight:
+    async def connect(cls, config: Config, persistent: HuecConfig | None = None) -> HueLight:
+        cached_address = persistent.device_addresses.get(config.device_name) if persistent else None
+
+        if cached_address:
+            assert persistent is not None
+            log.info("Trying cached address %s for '%s'...", cached_address, config.device_name)
+            try:
+                client = BleakClient(cached_address, timeout=config.timeout)
+                await client.connect(timeout=config.timeout)
+                log.debug("Connected via cached address, connected=%s", client.is_connected)
+                ins = cls(client=client, name=config.device_name, address=cached_address)
+                await ins.ensure_timer_notifications_started()
+                return ins
+            except (BleakError, TimeoutError, OSError) as exc:
+                log.warning(
+                    "Cached address %s for '%s' is no longer valid (%s), falling back to scan.",
+                    cached_address,
+                    config.device_name,
+                    exc,
+                )
+                persistent.device_addresses.pop(config.device_name, None)
+                persistent.save()
+
         log.debug("Scanning for '%s'...", config.device_name)
         device = await BleakScanner.find_device_by_name(config.device_name, timeout=config.timeout)
         if not device:
@@ -106,6 +166,11 @@ class HueLight:
         client = BleakClient(device, timeout=config.timeout)
         await client.connect(timeout=config.timeout)
         log.debug("Connected=%s", client.is_connected)
+
+        if persistent:
+            persistent.device_addresses[config.device_name] = device.address
+            persistent.save()
+
         ins = cls(
             client=client,
             name=device.name or config.device_name,
@@ -115,7 +180,6 @@ class HueLight:
         return ins
 
     async def reconnect(self) -> None:
-        """Re-establish the BLE connection after it has gone stale."""
         log.info("Reconnecting to %s (%s)...", self.name, self.address)
         try:
             await self.client.disconnect()
@@ -247,7 +311,6 @@ class HueLight:
         return AlarmListResult(raw=data, slot_ids=slot_ids)
 
     async def get_alarms(self) -> list[Alarm]:
-        """Read and parse all alarm slots."""
         slot_result = await self.get_alarm_ids()
 
         slots: list[Alarm] = []

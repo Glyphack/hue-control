@@ -1,5 +1,3 @@
-"""Data models for Hue lamp control and alarm operations."""
-
 from __future__ import annotations
 
 import struct

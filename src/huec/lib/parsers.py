@@ -1,5 +1,3 @@
-"""Payload parsing and encoding helpers for Hue lamp control."""
-
 from __future__ import annotations
 
 import logging

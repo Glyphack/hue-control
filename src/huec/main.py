@@ -1,10 +1,9 @@
-"""Simple BLE controller for Hue lightstrip plus."""
-
 from __future__ import annotations
 
 import argparse
 import asyncio
 import importlib.resources
+import json
 import logging
 import os
 import re
@@ -15,18 +14,20 @@ from urllib.parse import parse_qs, urlparse
 
 from huec.lib.hue import (
     COLOR_UUID,
-    DEFAULT_DEVICE_NAME,
     POWER_UUID,
     RGB_UUID,
     TIMER_UUID,
+    Config,
+    HuecConfig,
     HueLight,
 )
-from huec.lib.models import Config
 from huec.lib.parsers import bin_to_hex, hex_to_bin
 from huec.scripts.subscribe_all import subscribe_all
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 log = logging.getLogger("huec")
+
+
 BRIGHTNESS_BYTE_INDEX = 5
 MAX_BRIGHTNESS = 254
 KNOWN_CHARACTERISTIC_UUIDS = {
@@ -98,8 +99,8 @@ def build_args() -> argparse.ArgumentParser:
     parser.add_argument(
         "-d",
         "--device",
-        default=DEFAULT_DEVICE_NAME,
-        help=f"BLE device name. Default is {DEFAULT_DEVICE_NAME}",
+        default=None,
+        help=f"BLE device name. Default is read from {HuecConfig().get_config_path()}",
     )
     parser.add_argument("--timeout", type=float, default=15.0, help="BLE scan timeout.")
 
@@ -321,8 +322,6 @@ def build_args() -> argparse.ArgumentParser:
 
 
 async def run_interactive(light: HueLight) -> None:
-    """Run interactive mode HTTP server using the existing BLE connection."""
-
     loop = asyncio.get_running_loop()
 
     class Handler(BaseHTTPRequestHandler):
@@ -408,8 +407,8 @@ async def run_interactive(light: HueLight) -> None:
         server.server_close()
 
 
-async def run(args: argparse.Namespace, config: Config) -> None:
-    light = await HueLight.connect(config)
+async def run(args: argparse.Namespace, config: Config, persistent: HuecConfig) -> None:
+    light = await HueLight.connect(config, persistent)
     try:
         await handle_command(args, light, config)
     finally:
@@ -469,8 +468,6 @@ async def handle_command(args: argparse.Namespace, light: HueLight, config: Conf
                 log.debug(f"Mystery bytes:  {bin_to_hex(alarm.properties.mystery_bytes)}")
 
             if args.json_output:
-                import json
-
                 result = []
                 for alarm in alarms:
                     entry = {
@@ -639,11 +636,13 @@ def main() -> None:
     if args.command in {"wakeup", "timer", "sleep"}:
         raise SystemExit(f"The '{args.command}' command is temporarily disabled.")
 
-    config = Config(device_name=args.device, timeout=args.timeout)
+    persistent = HuecConfig.load()
+    device_name = args.device if args.device is not None else persistent.default_device
+    config = Config(device_name=device_name, timeout=args.timeout)
     log.debug("Using config=%s", config)
 
     try:
-        asyncio.run(run(args, config))
+        asyncio.run(run(args, config, persistent))
     except KeyboardInterrupt:
         raise SystemExit(130) from None
     except SystemExit as exc:
