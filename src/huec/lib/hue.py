@@ -30,7 +30,7 @@ from huec.lib.parsers import (
     parse_alarm_ids,
 )
 
-DEFAULT_DEVICE_NAME = "Hue lightstrip plus"
+DEFAULT_DEVICE_NAME = "5"
 POWER_UUID = "932c32bd-0002-47a2-835a-a8d455b859dd"
 COLOR_UUID = "932c32bd-0007-47a2-835a-a8d455b859dd"
 RGB_UUID = "932c32bd-0005-47a2-835a-a8d455b859dd"
@@ -194,6 +194,10 @@ class HueLight:
 
     async def read_color(self) -> bytes:
         return await self.read_characteristic(COLOR_UUID)
+
+    async def get_brightness(self) -> int:
+        color_payload = await self.read_color()
+        return color_payload[5]
 
     @retry_async(attempts=20, delay_seconds=0.3, operation="Setting power")
     async def set_power(self, on: bool) -> None:

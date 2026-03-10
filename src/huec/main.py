@@ -110,6 +110,13 @@ def build_args() -> argparse.ArgumentParser:
         help="Start HTTP server and keep BLE connection open.",
     )
 
+    parser.add_argument(
+            "--port",
+            type=int,
+            default=8000,
+            help="port for the interactive server, dafualt is 8000",
+    )
+
     power = subparsers.add_parser("power", help="Turn the light on or off.")
     power.add_argument("state", choices=["on", "off"], help="Power state.")
 
@@ -320,10 +327,17 @@ def build_args() -> argparse.ArgumentParser:
     return parser
 
 
-async def run_interactive(light: HueLight) -> None:
+async def run_interactive(light: HueLight, port:int) -> None:
     """Run interactive mode HTTP server using the existing BLE connection."""
 
     loop = asyncio.get_running_loop()
+    current_payload = await light.read_color()
+    state_box = {
+        "brightness": current_payload[BRIGHTNESS_BYTE_INDEX],
+        "colorhex": current_payload.hex(),
+    }
+    current_brightness = (await light.read_color())[BRIGHTNESS_BYTE_INDEX]
+    brightness_box = {"value": current_brightness}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
@@ -383,6 +397,9 @@ async def run_interactive(light: HueLight) -> None:
                     try:
                         future = asyncio.run_coroutine_threadsafe(light.set_color(data_bytes), loop)
                         future.result()
+                        if len(data_bytes) > BRIGHTNESS_BYTE_INDEX:
+                            state_box["brightness"] = data_bytes[BRIGHTNESS_BYTE_INDEX]
+                            state_box["colorhex"] = data_bytes.hex()
                     except Exception:
                         log.exception("BLE write failed")
 
@@ -390,17 +407,30 @@ async def run_interactive(light: HueLight) -> None:
                     self.end_headers()
                     self.wfile.write(b"OK")
                     return
+            
+
+            if parsed.path == "/brightness":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(str(state_box["brightness"]).encode())
+                return
+
+            if parsed.path == "/colorhex":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(state_box["colorhex"].encode())
+                return
 
             self.send_response(404)
             self.end_headers()
 
     threading.Thread(
-        target=lambda: (time.sleep(0.02), os.system("open http://localhost:8000")),
+        target=lambda: (time.sleep(0.02), os.system(f"open http://localhost:{port}")),
         daemon=True,
     ).start()
 
-    log.debug("interactive server running at http://localhost:8000")
-    server = HTTPServer(("localhost", 8000), Handler)
+    log.debug(f"interactive server running at http://localhost:{port}")
+    server = HTTPServer(("localhost", port), Handler)
     try:
         await asyncio.to_thread(server.serve_forever)
     finally:
@@ -410,6 +440,8 @@ async def run_interactive(light: HueLight) -> None:
 
 async def run(args: argparse.Namespace, config: Config) -> None:
     light = await HueLight.connect(config)
+
+    #initial_brightness = await light.get_brightness()
     try:
         await handle_command(args, light, config)
     finally:
@@ -418,7 +450,7 @@ async def run(args: argparse.Namespace, config: Config) -> None:
 
 async def handle_command(args: argparse.Namespace, light: HueLight, config: Config) -> None:
     if args.command == "interactive":
-        await run_interactive(light)
+        await run_interactive(light, args.port)
         return
 
     if args.command == "power":
