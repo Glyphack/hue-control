@@ -19,7 +19,6 @@ from huec.lib.models import (
     AlarmDeleteResult,
     AlarmEnableResult,
     AlarmListResult,
-    Config,
 )
 from huec.lib.parsers import (
     bin_to_hex,
@@ -44,6 +43,8 @@ DEFAULT_DEVICE_NAME = "Hue lightstrip plus"
 class HuecConfig:
     default_device: str = DEFAULT_DEVICE_NAME
     device_addresses: dict[str, str] = field(default_factory=dict)
+    device_name: str = DEFAULT_DEVICE_NAME
+    timeout: float = 10.0
 
     def get_config_path(self):
         home_str = str(Path.home())
@@ -134,11 +135,10 @@ class HueLight:
     _timer_notifications_started: bool = field(default=False, init=False, repr=False)
 
     @classmethod
-    async def connect(cls, config: Config, persistent: HuecConfig | None = None) -> HueLight:
-        cached_address = persistent.device_addresses.get(config.device_name) if persistent else None
+    async def connect(cls, config: HuecConfig) -> HueLight:
+        cached_address = config.device_addresses.get(config.device_name)
 
         if cached_address:
-            assert persistent is not None
             log.info("Trying cached address %s for '%s'...", cached_address, config.device_name)
             try:
                 client = BleakClient(cached_address, timeout=config.timeout)
@@ -154,8 +154,8 @@ class HueLight:
                     config.device_name,
                     exc,
                 )
-                persistent.device_addresses.pop(config.device_name, None)
-                persistent.save()
+                config.device_addresses.pop(config.device_name, None)
+                config.save()
 
         log.debug("Scanning for '%s'...", config.device_name)
         device = await BleakScanner.find_device_by_name(config.device_name, timeout=config.timeout)
@@ -167,9 +167,8 @@ class HueLight:
         await client.connect(timeout=config.timeout)
         log.debug("Connected=%s", client.is_connected)
 
-        if persistent:
-            persistent.device_addresses[config.device_name] = device.address
-            persistent.save()
+        config.device_addresses[config.device_name] = device.address
+        config.save()
 
         ins = cls(
             client=client,

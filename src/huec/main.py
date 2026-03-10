@@ -17,7 +17,6 @@ from huec.lib.hue import (
     POWER_UUID,
     RGB_UUID,
     TIMER_UUID,
-    Config,
     HuecConfig,
     HueLight,
 )
@@ -407,15 +406,15 @@ async def run_interactive(light: HueLight) -> None:
         server.server_close()
 
 
-async def run(args: argparse.Namespace, config: Config, persistent: HuecConfig) -> None:
-    light = await HueLight.connect(config, persistent)
+async def run(args: argparse.Namespace, config: HuecConfig) -> None:
+    light = await HueLight.connect(config)
     try:
         await handle_command(args, light, config)
     finally:
         await light.disconnect()
 
 
-async def handle_command(args: argparse.Namespace, light: HueLight, config: Config) -> None:
+async def handle_command(args: argparse.Namespace, light: HueLight, config: HuecConfig) -> None:
     if args.command == "interactive":
         await run_interactive(light)
         return
@@ -552,7 +551,7 @@ async def handle_command(args: argparse.Namespace, light: HueLight, config: Conf
         await handle_dev(args, light, config)
 
 
-async def handle_dev(args: argparse.Namespace, light: HueLight, config: Config) -> None:
+async def handle_dev(args: argparse.Namespace, light: HueLight, config: HuecConfig) -> None:
     if args.dev_command == "set-characteristic":
         payload = hex_to_bin(args.data)
         if args.characteristic is not None:
@@ -638,11 +637,12 @@ def main() -> None:
 
     persistent = HuecConfig.load()
     device_name = args.device if args.device is not None else persistent.default_device
-    config = Config(device_name=device_name, timeout=args.timeout)
-    log.debug("Using config=%s", config)
+    persistent.device_name = device_name
+    persistent.timeout = args.timeout
+    log.debug("Using config=%s", persistent)
 
     try:
-        asyncio.run(run(args, config, persistent))
+        asyncio.run(run(args, persistent))
     except KeyboardInterrupt:
         raise SystemExit(130) from None
     except SystemExit as exc:

@@ -5,12 +5,6 @@ from dataclasses import dataclass
 from datetime import datetime
 
 
-@dataclass(frozen=True)
-class Config:
-    device_name: str
-    timeout: float
-
-
 @dataclass
 class AlarmProperties:
     active: bool
