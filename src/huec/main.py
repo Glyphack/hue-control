@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import time
+from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -89,7 +90,12 @@ def configure_logging(debug: bool) -> None:
 
 
 def build_args() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Control Hue lightstrip over BLE.")
+    config_example = json.dumps(asdict(HuecConfig()), indent=2)
+    parser = argparse.ArgumentParser(
+        description="Control Hue lightstrip over BLE.",
+        epilog=f"Config file ({HuecConfig().get_config_path()}) format:\n{config_example}",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--debug",
         action="store_true",
@@ -635,14 +641,14 @@ def main() -> None:
     if args.command in {"wakeup", "timer", "sleep"}:
         raise SystemExit(f"The '{args.command}' command is temporarily disabled.")
 
-    persistent = HuecConfig.load()
-    device_name = args.device if args.device is not None else persistent.default_device
-    persistent.device_name = device_name
-    persistent.timeout = args.timeout
-    log.debug("Using config=%s", persistent)
+    cfg = HuecConfig.load()
+    device_name = args.device if args.device is not None else cfg.default_device
+    cfg.device_name = device_name
+    cfg.timeout = args.timeout
+    log.debug("Using config=%s", cfg)
 
     try:
-        asyncio.run(run(args, persistent))
+        asyncio.run(run(args, cfg))
     except KeyboardInterrupt:
         raise SystemExit(130) from None
     except SystemExit as exc:
@@ -651,7 +657,7 @@ def main() -> None:
             raise SystemExit(1) from None
         raise
     except Exception as exc:
-        log.debug("Operation failed with config=%s", config, exc_info=True)
+        log.debug("Operation failed with config=%s", cfg, exc_info=True)
         print(f"Operation failed: {exc}")
         raise SystemExit(1) from None
 
