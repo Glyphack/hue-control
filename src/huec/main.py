@@ -10,8 +10,10 @@ import os
 import re
 import threading
 import time
+import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
+from datetime import datetime, timedelta
 
 from huec.lib.hue import (
     COLOR_UUID,
@@ -339,6 +341,69 @@ async def run_interactive(light: HueLight, port:int) -> None:
     current_brightness = (await light.read_color())[BRIGHTNESS_BYTE_INDEX]
     brightness_box = {"value": current_brightness}
 
+    def serialize_alarm(alarm):
+        ts = alarm.properties.timestamp
+        local_ts = ts.astimezone()
+        #debug
+        #print("RAW:", alarm.properties.timestamp)
+        #print("TZINFO:", alarm.properties.timestamp.tzinfo)
+        #print("LOCAL:", alarm.properties.timestamp.astimezone())
+        entry = {
+            "id": alarm._id,
+            "active": alarm.properties.active,
+            "name": alarm.properties.name,
+            "timestamp": ts.isoformat(),
+            "local_time": local_ts.strftime("%H:%M"),
+            "kind": "wake_or_sleep" if alarm.is_wake_up_or_sleep() else "regular"
+        }
+        duration = None
+        try:
+            duration = alarm.extract_timer_duration_seconds()
+            entry["duration_seconds"] = duration
+        except Exception:
+            pass
+
+        if alarm.is_wake_up_or_sleep() and duration is not None:
+            finish_ts = local_ts + timedelta(seconds=duration)
+            entry["local_finish_time"] = finish_ts.strftime("%H:%M")
+
+        return entry
+        
+    async def list_alarms_json() -> bytes:
+        alarms = await light.get_alarms()
+        result = [serialize_alarm(alarm) for alarm in alarms]
+        return json.dumps(result, indent=2).encode()
+
+    async def enable_alarm_by_id(alarm_id: int) -> None:
+        alarms = await light.get_alarms()
+        alarms = [alarm for alarm in alarms if alarm._id == alarm_id]
+        if not alarms:
+            raise ValueError("Alarm ID not found")
+        for alarm in alarms:
+            result = await light.enable_alarm(alarm)
+            if not result.is_ok():
+                raise RuntimeError("Enable alarm failed")
+
+    async def disable_alarm_by_id(alarm_id: int) -> None:
+        alarms = await light.get_alarms()
+        alarms = [alarm for alarm in alarms if alarm._id == alarm_id]
+        if not alarms:
+            raise ValueError("Alarm ID not found")
+        for alarm in alarms:
+            result = await light.disable_alarm(alarm)
+            if not result.is_ok():
+                raise RuntimeError("Disable alarm failed")
+
+    async def delete_alarm_by_id(alarm_id: int) -> None:
+        id_result = await light.get_alarm_ids()
+        ids = id_result.slot_ids
+        if alarm_id not in ids:
+            raise ValueError("Alarm ID not found")
+        slot_index = ids.index(alarm_id)
+        result = await light.delete_alarm(slot_index)
+        if not result.is_ok():
+            raise RuntimeError("Delete alarm failed")
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
             parsed = urlparse(self.path)
@@ -419,6 +484,99 @@ async def run_interactive(light: HueLight, port:int) -> None:
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(state_box["colorhex"].encode())
+                return
+
+            if parsed.path == "/alarms/list":
+                try:
+                    future = asyncio.run_coroutine_threadsafe(list_alarms_json(), loop)
+                    payload = future.result()
+                    self.send_response(200)
+                    self.send_header("Content-type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                except Exception:
+                    log.exception("Alarm list failed")
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"Alarm list failed")
+                return
+
+            if parsed.path == "/alarms/enable":
+                qs = parse_qs(parsed.query)
+                if "id" not in qs:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Missing id")
+                    return
+
+                try:
+                    alarm_id = int(qs["id"][0])
+                    future = asyncio.run_coroutine_threadsafe(enable_alarm_by_id(alarm_id), loop)
+                    future.result()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"OK")
+                except ValueError:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Bad id")
+                except Exception:
+                    log.exception("Enable alarm failed")
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"Enable alarm failed")
+                return
+
+            if parsed.path == "/alarms/disable":
+                qs = parse_qs(parsed.query)
+                if "id" not in qs:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Missing id")
+                    return
+
+                try:
+                    alarm_id = int(qs["id"][0])
+                    future = asyncio.run_coroutine_threadsafe(disable_alarm_by_id(alarm_id), loop)
+                    future.result()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"OK")
+                except ValueError:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Bad id")
+                except Exception:
+                    log.exception("Disable alarm failed")
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"Disable alarm failed")
+                return
+
+            if parsed.path == "/alarms/delete":
+                qs = parse_qs(parsed.query)
+                if "id" not in qs:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Missing id")
+                    return
+
+                try:
+                    alarm_id = int(qs["id"][0])
+                    future = asyncio.run_coroutine_threadsafe(delete_alarm_by_id(alarm_id), loop)
+                    future.result()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"OK")
+                except ValueError:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Bad id")
+                except Exception:
+                    log.exception("Delete alarm failed")
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"Delete alarm failed")
                 return
 
             self.send_response(404)

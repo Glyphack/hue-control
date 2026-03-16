@@ -1,16 +1,7 @@
 #!/usr/bin/env bash
 
-# Better minimal TUI for Glyphack/hue-control HTTP bridge
 # Starts the hue interactive server automatically.
 #
-# Requires:
-#   - uv / uvx
-#   - curl
-#   - whiptail
-#
-# The interactive mode of hue-control starts the HTTP server and
-# keeps the BLE connection open, which is exactly what this TUI needs.
-# Repo usage confirms:
 #   uvx huec --device "Hue lightstrip" interactive
 #   -> starts HTTP server / keeps BLE connection open
 
@@ -19,8 +10,17 @@ BASE_URL_2="http://127.0.0.1:8002"
 
 CURRENT_SELECTION="both"
 
-DEVICE_1_NAME="Hue lightstrip"
-DEVICE_2_NAME="3"
+#DEVICE_1_NAME="Hue lightstrip"
+#DEVICE_2_NAME="3"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/huemenu.conf"
+
+if [ -f "$CONFIG_FILE" ]; then
+    . "$CONFIG_FILE"
+else
+    echo "Missing config file: $CONFIG_FILE"
+    exit 1
+fi
 DEVICE_BOTH_NAME="BOTH"
 #add new device etc
 
@@ -102,7 +102,10 @@ start_one_hue_server() {
 
 start_hue_servers() {
     start_one_hue_server "$DEVICE_1_NAME" "$BASE_URL_1" 8001 /tmp/hue-tui-1.log HUE_PID_1 || return 1
-    start_one_hue_server "$DEVICE_2_NAME" "$BASE_URL_2" 8002 /tmp/hue-tui-2.log HUE_PID_2 || return 1
+    if [ -n "$DEVICE_2_NAME" ]; then
+
+      start_one_hue_server "$DEVICE_2_NAME" "$BASE_URL_2" 8002 /tmp/hue-tui-2.log HUE_PID_2 || return 1
+    fi
     return 0
 }
 
@@ -142,6 +145,180 @@ live_brightness_text() {
             ;;
     esac
 }
+
+
+
+get_alarms_from() {
+    url="$1"
+    curl -s --max-time 2 "${url}/alarms/list"
+}
+
+
+enable_alarm_from() {
+    url="$1"
+    alarm_id="$2"
+    curl -s --max-time 2 "${url}/alarms/enable?id=${alarm_id}" >/dev/null
+}
+
+disable_alarm_from() {
+    url="$1"
+    alarm_id="$2"
+    curl -s --max-time 2 "${url}/alarms/disable?id=${alarm_id}" >/dev/null
+}
+
+toggle_alarm_from() {
+    url="$1"
+    alarm_id="$2"
+    active="$3"
+
+    if [ "$active" = "true" ]; then
+        disable_alarm_from "$url" "$alarm_id"
+    else
+        enable_alarm_from "$url" "$alarm_id"
+    fi
+}
+
+
+
+format_alarms_from() {
+    url="$1"
+    json="$(get_alarms_from "$url")"
+
+    if [ -z "$json" ]; then
+        printf 'Could not read alarms.\n'
+        return
+    fi
+
+    printf '%s\n' "$json" | python3 -c '
+import sys, json
+
+try:
+    alarms = json.load(sys.stdin)
+except Exception:
+    print("Invalid alarm data.")
+    raise SystemExit(0)
+
+if not alarms:
+    print("No alarms set.")
+    raise SystemExit(0)
+
+for alarm in alarms:
+    alarm_id = alarm.get("id", "?")
+    name = alarm.get("name", "")
+    active = "ON " if alarm.get("active") else "OFF"
+    kind = alarm.get("kind", "regular")
+
+    if kind == "wake_or_sleep":
+        start = alarm.get("local_time", "?")
+        print(f"[{active}] {name} (ID {alarm_id})")
+        print(f"      begins {start}")
+        print(f"      fade   30m")
+    else:
+        ts = alarm.get("local_time", alarm.get("timestamp", ""))
+        print(f"[{active}] {name} (ID {alarm_id})")
+        print(f"      time   {ts}")
+
+'
+}
+
+alarms_text() {
+    case "$CURRENT_SELECTION" in
+        1)
+            printf '=== %s ===\n' "$DEVICE_1_NAME"
+            format_alarms_from "$BASE_URL_1"
+            ;;
+        2)
+            printf '=== %s ===\n' "$DEVICE_2_NAME"
+            format_alarms_from "$BASE_URL_2"
+            ;;
+        both)
+            printf '=== %s ===\n' "$DEVICE_1_NAME"
+            format_alarms_from "$BASE_URL_1"
+            printf '\n=== %s ===\n' "$DEVICE_2_NAME"
+            format_alarms_from "$BASE_URL_2"
+            ;;
+    esac
+}
+
+
+
+choose_and_toggle_alarm_from() {
+    url="$1"
+    device_name="$2"
+
+    json="$(get_alarms_from "$url")"
+
+    if [ -z "$json" ]; then
+        msg "Could not read alarms for $device_name."
+        return
+    fi
+
+    selection="$(printf '%s\n' "$json" | python3 -c '
+import sys, json
+
+try:
+    alarms = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+
+if not alarms:
+    raise SystemExit(2)
+
+for alarm in alarms:
+    alarm_id = alarm.get("id", "")
+    name = alarm.get("name", "")
+    active = "ON" if alarm.get("active") else "OFF"
+    local_time = alarm.get("local_time", "?")
+    active_raw = "true" if alarm.get("active") else "false"
+    print(f"{alarm_id}|{active_raw}|[{active}] {name} ({local_time})")
+' 2>/dev/null)"
+
+    status=$?
+
+    if [ "$status" -eq 1 ]; then
+        msg "Invalid alarm data for $device_name."
+        return
+    fi
+
+    if [ "$status" -eq 2 ] || [ -z "$selection" ]; then
+        msg "No alarms set on $device_name."
+        return
+    fi
+
+    alarm_ids=()
+    alarm_states=()
+    labels=()
+
+    while IFS='|' read -r alarm_id active label; do
+        alarm_ids+=("$alarm_id")
+        alarm_states+=("$active")
+        labels+=("$label")
+    done <<EOF
+$selection
+EOF
+
+    choice=0
+    run_menu "Toggle Alarm - $device_name" choice "${labels[@]}" "Back" || return
+
+    if [ "$choice" -ge "${#alarm_ids[@]}" ]; then
+        return
+    fi
+
+    alarm_id="${alarm_ids[$choice]}"
+    active="${alarm_states[$choice]}"
+
+    toggle_alarm_from "$url" "$alarm_id" "$active"
+
+    if [ "$active" = "true" ]; then
+        msg "Alarm $alarm_id disabled on $device_name."
+    else
+        msg "Alarm $alarm_id enabled on $device_name."
+    fi
+}
+
+
+
+
 send_power_to() {
     url="$1"
     state="$2"
@@ -325,6 +502,10 @@ adjust_brightness_percent() {
 # Menus
 # -----------------------------
 
+
+
+
+
 draw_menu() {
     title="$1"
     selected="$2"
@@ -410,6 +591,56 @@ run_menu() {
         esac
     done
 }
+
+
+alarms_menu() {
+    while true; do
+        clear
+        printf '==============================\n'
+        printf '          Alarms\n'
+        printf '==============================\n\n'
+        printf 'Current device: %s\n\n' "$CURRENT_SELECTION"
+
+        alarms_text
+        printf '\n[t] toggle an alarm   [q] back\n'
+
+        if [ -n "$STATUS_MSG" ]; then
+            printf '\n%s\n' "$STATUS_MSG"
+        fi
+
+        key="$(read_key)" || return
+        case "$key" in
+            t|T)
+                case "$CURRENT_SELECTION" in
+                    1)
+                        choose_and_toggle_alarm_from "$BASE_URL_1" "$DEVICE_1_NAME"
+                        ;;
+                    2)
+                        choose_and_toggle_alarm_from "$BASE_URL_2" "$DEVICE_2_NAME"
+                        ;;
+                    both)
+                      device_choice=0
+                      run_menu "Select Device" device_choice \
+                          "$DEVICE_1_NAME" \
+                          "$DEVICE_2_NAME" \
+                          "Back" || continue
+
+                      case "$device_choice" in
+                          0) choose_and_toggle_alarm_from "$BASE_URL_1" "$DEVICE_1_NAME" ;;
+                          1) choose_and_toggle_alarm_from "$BASE_URL_2" "$DEVICE_2_NAME" ;;
+                          *) ;;
+                      esac
+                      ;;
+                                    esac
+                ;;
+            q|Q)
+                return
+                ;;
+        esac
+    done
+}
+
+
 
 
 device_menu() {
@@ -538,7 +769,7 @@ main_menu() {
         run_menu "Hue Control" choice \
             "Power" \
             "Brightness" \
-            "Colors" \
+            "Alarms" \
             "Presets" \
             "Devices" \
             "Quit" || exit 0
@@ -546,7 +777,7 @@ main_menu() {
         case "$choice" in
             0) power_menu ;;
             1) brightness_menu ;;
-            2) color_menu ;;
+            2) alarms_menu ;;
             3) preset_menu ;;
             4) device_menu ;;
             5) exit 0 ;;
