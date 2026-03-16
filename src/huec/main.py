@@ -10,8 +10,10 @@ import os
 import re
 import threading
 import time
+import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
+from datetime import datetime, timedelta
 
 from huec.lib.hue import (
     COLOR_UUID,
@@ -108,6 +110,13 @@ def build_args() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "interactive",
         help="Start HTTP server and keep BLE connection open.",
+    )
+
+    parser.add_argument(
+            "--port",
+            type=int,
+            default=8000,
+            help="port for the interactive server, dafualt is 8000",
     )
 
     power = subparsers.add_parser("power", help="Turn the light on or off.")
@@ -320,10 +329,80 @@ def build_args() -> argparse.ArgumentParser:
     return parser
 
 
-async def run_interactive(light: HueLight) -> None:
+async def run_interactive(light: HueLight, port:int) -> None:
     """Run interactive mode HTTP server using the existing BLE connection."""
 
     loop = asyncio.get_running_loop()
+    current_payload = await light.read_color()
+    state_box = {
+        "brightness": current_payload[BRIGHTNESS_BYTE_INDEX],
+        "colorhex": current_payload.hex(),
+    }
+    current_brightness = (await light.read_color())[BRIGHTNESS_BYTE_INDEX]
+    brightness_box = {"value": current_brightness}
+
+    def serialize_alarm(alarm):
+        ts = alarm.properties.timestamp
+        local_ts = ts.astimezone()
+        #debug
+        #print("RAW:", alarm.properties.timestamp)
+        #print("TZINFO:", alarm.properties.timestamp.tzinfo)
+        #print("LOCAL:", alarm.properties.timestamp.astimezone())
+        entry = {
+            "id": alarm._id,
+            "active": alarm.properties.active,
+            "name": alarm.properties.name,
+            "timestamp": ts.isoformat(),
+            "local_time": local_ts.strftime("%H:%M"),
+            "kind": "wake_or_sleep" if alarm.is_wake_up_or_sleep() else "regular"
+        }
+        duration = None
+        try:
+            duration = alarm.extract_timer_duration_seconds()
+            entry["duration_seconds"] = duration
+        except Exception:
+            pass
+
+        if alarm.is_wake_up_or_sleep() and duration is not None:
+            finish_ts = local_ts + timedelta(seconds=duration)
+            entry["local_finish_time"] = finish_ts.strftime("%H:%M")
+
+        return entry
+        
+    async def list_alarms_json() -> bytes:
+        alarms = await light.get_alarms()
+        result = [serialize_alarm(alarm) for alarm in alarms]
+        return json.dumps(result, indent=2).encode()
+
+    async def enable_alarm_by_id(alarm_id: int) -> None:
+        alarms = await light.get_alarms()
+        alarms = [alarm for alarm in alarms if alarm._id == alarm_id]
+        if not alarms:
+            raise ValueError("Alarm ID not found")
+        for alarm in alarms:
+            result = await light.enable_alarm(alarm)
+            if not result.is_ok():
+                raise RuntimeError("Enable alarm failed")
+
+    async def disable_alarm_by_id(alarm_id: int) -> None:
+        alarms = await light.get_alarms()
+        alarms = [alarm for alarm in alarms if alarm._id == alarm_id]
+        if not alarms:
+            raise ValueError("Alarm ID not found")
+        for alarm in alarms:
+            result = await light.disable_alarm(alarm)
+            if not result.is_ok():
+                raise RuntimeError("Disable alarm failed")
+
+    async def delete_alarm_by_id(alarm_id: int) -> None:
+        id_result = await light.get_alarm_ids()
+        ids = id_result.slot_ids
+        if alarm_id not in ids:
+            raise ValueError("Alarm ID not found")
+        slot_index = ids.index(alarm_id)
+        result = await light.delete_alarm(slot_index)
+        if not result.is_ok():
+            raise RuntimeError("Delete alarm failed")
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
@@ -383,6 +462,9 @@ async def run_interactive(light: HueLight) -> None:
                     try:
                         future = asyncio.run_coroutine_threadsafe(light.set_color(data_bytes), loop)
                         future.result()
+                        if len(data_bytes) > BRIGHTNESS_BYTE_INDEX:
+                            state_box["brightness"] = data_bytes[BRIGHTNESS_BYTE_INDEX]
+                            state_box["colorhex"] = data_bytes.hex()
                     except Exception:
                         log.exception("BLE write failed")
 
@@ -390,17 +472,123 @@ async def run_interactive(light: HueLight) -> None:
                     self.end_headers()
                     self.wfile.write(b"OK")
                     return
+            
+
+            if parsed.path == "/brightness":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(str(state_box["brightness"]).encode())
+                return
+
+            if parsed.path == "/colorhex":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(state_box["colorhex"].encode())
+                return
+
+            if parsed.path == "/alarms/list":
+                try:
+                    future = asyncio.run_coroutine_threadsafe(list_alarms_json(), loop)
+                    payload = future.result()
+                    self.send_response(200)
+                    self.send_header("Content-type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                except Exception:
+                    log.exception("Alarm list failed")
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"Alarm list failed")
+                return
+
+            if parsed.path == "/alarms/enable":
+                qs = parse_qs(parsed.query)
+                if "id" not in qs:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Missing id")
+                    return
+
+                try:
+                    alarm_id = int(qs["id"][0])
+                    future = asyncio.run_coroutine_threadsafe(enable_alarm_by_id(alarm_id), loop)
+                    future.result()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"OK")
+                except ValueError:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Bad id")
+                except Exception:
+                    log.exception("Enable alarm failed")
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"Enable alarm failed")
+                return
+
+            if parsed.path == "/alarms/disable":
+                qs = parse_qs(parsed.query)
+                if "id" not in qs:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Missing id")
+                    return
+
+                try:
+                    alarm_id = int(qs["id"][0])
+                    future = asyncio.run_coroutine_threadsafe(disable_alarm_by_id(alarm_id), loop)
+                    future.result()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"OK")
+                except ValueError:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Bad id")
+                except Exception:
+                    log.exception("Disable alarm failed")
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"Disable alarm failed")
+                return
+
+            if parsed.path == "/alarms/delete":
+                qs = parse_qs(parsed.query)
+                if "id" not in qs:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Missing id")
+                    return
+
+                try:
+                    alarm_id = int(qs["id"][0])
+                    future = asyncio.run_coroutine_threadsafe(delete_alarm_by_id(alarm_id), loop)
+                    future.result()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"OK")
+                except ValueError:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Bad id")
+                except Exception:
+                    log.exception("Delete alarm failed")
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"Delete alarm failed")
+                return
 
             self.send_response(404)
             self.end_headers()
 
     threading.Thread(
-        target=lambda: (time.sleep(0.02), os.system("open http://localhost:8000")),
+        target=lambda: (time.sleep(0.02), os.system(f"open http://localhost:{port}")),
         daemon=True,
     ).start()
 
-    log.debug("interactive server running at http://localhost:8000")
-    server = HTTPServer(("localhost", 8000), Handler)
+    log.debug(f"interactive server running at http://localhost:{port}")
+    server = HTTPServer(("localhost", port), Handler)
     try:
         await asyncio.to_thread(server.serve_forever)
     finally:
@@ -410,6 +598,8 @@ async def run_interactive(light: HueLight) -> None:
 
 async def run(args: argparse.Namespace, config: Config) -> None:
     light = await HueLight.connect(config)
+
+    #initial_brightness = await light.get_brightness()
     try:
         await handle_command(args, light, config)
     finally:
@@ -418,7 +608,7 @@ async def run(args: argparse.Namespace, config: Config) -> None:
 
 async def handle_command(args: argparse.Namespace, light: HueLight, config: Config) -> None:
     if args.command == "interactive":
-        await run_interactive(light)
+        await run_interactive(light, args.port)
         return
 
     if args.command == "power":

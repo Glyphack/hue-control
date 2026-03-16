@@ -50,6 +50,11 @@ options:
   --timeout TIMEOUT     BLE scan timeout.
 ```
 
+### TUI
+There is a simple TUI being developed, you can run the huemenu bash script located in the src folder, 
+
+You must edit the huemenu config file with the name of your light(s). If you have one light leave the second one empty.
+
 ## Development
 
 I tested it on my hue lightstrip and it works.

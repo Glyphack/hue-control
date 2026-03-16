@@ -1,0 +1,804 @@
+#!/usr/bin/env bash
+
+# Starts the hue interactive server automatically.
+#
+#   uvx huec --device "Hue lightstrip" interactive
+#   -> starts HTTP server / keeps BLE connection open
+
+BASE_URL_1="http://127.0.0.1:8001"
+BASE_URL_2="http://127.0.0.1:8002"
+
+CURRENT_SELECTION="both"
+
+#DEVICE_1_NAME="Hue lightstrip"
+#DEVICE_2_NAME="3"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/huemenu.conf"
+
+if [ -f "$CONFIG_FILE" ]; then
+    . "$CONFIG_FILE"
+else
+    echo "Missing config file: $CONFIG_FILE"
+    exit 1
+fi
+DEVICE_BOTH_NAME="BOTH"
+#add new device etc
+
+HUE_PID_1=""
+HUE_PID_2=""
+
+LAST_DATA_1=""
+LAST_DATA_2=""
+
+# Presets 
+
+PRESET_energize="0101010201fe03029c00"
+PRESET_read="0101010201fe03025a01"
+PRESET_santorini="0101010201ca04047777374b0713500000004f155461976ae487709f8873293a590801a0"
+PRESET_coastal_nights="0101010201a604046f3726220713500000008d78765e1978d7f86396e83db7842808019a"
+PRESET_malibu_pink="0101010201cb04046e275814071350000000262c62f0294a09d8376643305a23180801b0"
+PRESET_arctic_aurora="01010102014204047527731507135000000080c4891f657511a46571832d5b73190801a0"
+PRESET_still_waters="0101010201ad04046d3f00290713500000003f095cad886074174bcc964465a53008019a"
+PRESET_ruby_romance="0101010201d6040411944064060102080180"
+
+
+
+PRESET_amsterdam="0101010201ca04041e85856b071350000000f6287b147a948b54a275a370293a590801a0"
+
+# ---------------------------------------------------
+# Colors
+# Replace these with hex payloads you KNOW already work
+# ---------------------------------------------------
+COLOR_red=""
+COLOR_green=""
+COLOR_blue=""
+COLOR_white=""
+
+
+
+# -----------------------------
+# Cleanup
+# -----------------------------
+cleanup() {
+    if [ -n "$HUE_PID_1" ] && kill -0 "$HUE_PID_1" 2>/dev/null; then
+        kill "$HUE_PID_1" 2>/dev/null
+        wait "$HUE_PID_1" 2>/dev/null
+    fi
+
+    if [ -n "$HUE_PID_2" ] && kill -0 "$HUE_PID_2" 2>/dev/null; then
+        kill "$HUE_PID_2" 2>/dev/null
+        wait "$HUE_PID_2" 2>/dev/null
+    fi
+}
+trap cleanup EXIT INT TERM
+
+start_one_hue_server() {
+    device="$1"
+    url="$2"
+    port="$3"
+    log="$4"
+    pid_var="$5"
+
+    if curl -s --max-time 1 "$url" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    uv run huec --device "$device" --port "$port" interactive >"$log" 2>&1 &
+    pid=$!
+
+    eval "$pid_var=$pid"
+
+    i=0
+    while [ "$i" -lt 20 ]; do
+        if curl -s --max-time 1 "$url" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+
+    return 1
+}
+
+start_hue_servers() {
+    start_one_hue_server "$DEVICE_1_NAME" "$BASE_URL_1" 8001 /tmp/hue-tui-1.log HUE_PID_1 || return 1
+    if [ -n "$DEVICE_2_NAME" ]; then
+
+      start_one_hue_server "$DEVICE_2_NAME" "$BASE_URL_2" 8002 /tmp/hue-tui-2.log HUE_PID_2 || return 1
+    fi
+    return 0
+}
+
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+get_colorhex_from() {
+    url="$1"
+    curl -s --max-time 1 "${url}/colorhex"
+}
+get_brightness_from() {
+    url="$1"
+    curl -s --max-time 1 "${url}/brightness"
+}
+
+
+live_brightness_text() {
+    case "$CURRENT_SELECTION" in
+        1)
+            bri="$(get_brightness_from "$BASE_URL_1")"
+            [ -n "$bri" ] && printf '%s%%' "$(bri_to_percent "$bri")" || printf 'unknown'
+            ;;
+        2)
+            bri="$(get_brightness_from "$BASE_URL_2")"
+            [ -n "$bri" ] && printf '%s%%' "$(bri_to_percent "$bri")" || printf 'unknown'
+            ;;
+        both)
+            bri1="$(get_brightness_from "$BASE_URL_1")"
+            bri2="$(get_brightness_from "$BASE_URL_2")"
+
+            [ -n "$bri1" ] && pct1="$(bri_to_percent "$bri1")" || pct1="?"
+            [ -n "$bri2" ] && pct2="$(bri_to_percent "$bri2")" || pct2="?"
+
+            printf '1:%s%%  2:%s%%' "$pct1" "$pct2"
+            ;;
+    esac
+}
+
+
+
+get_alarms_from() {
+    url="$1"
+    curl -s --max-time 2 "${url}/alarms/list"
+}
+
+
+enable_alarm_from() {
+    url="$1"
+    alarm_id="$2"
+    curl -s --max-time 2 "${url}/alarms/enable?id=${alarm_id}" >/dev/null
+}
+
+disable_alarm_from() {
+    url="$1"
+    alarm_id="$2"
+    curl -s --max-time 2 "${url}/alarms/disable?id=${alarm_id}" >/dev/null
+}
+
+toggle_alarm_from() {
+    url="$1"
+    alarm_id="$2"
+    active="$3"
+
+    if [ "$active" = "true" ]; then
+        disable_alarm_from "$url" "$alarm_id"
+    else
+        enable_alarm_from "$url" "$alarm_id"
+    fi
+}
+
+
+
+format_alarms_from() {
+    url="$1"
+    json="$(get_alarms_from "$url")"
+
+    if [ -z "$json" ]; then
+        printf 'Could not read alarms.\n'
+        return
+    fi
+
+    printf '%s\n' "$json" | python3 -c '
+import sys, json
+
+try:
+    alarms = json.load(sys.stdin)
+except Exception:
+    print("Invalid alarm data.")
+    raise SystemExit(0)
+
+if not alarms:
+    print("No alarms set.")
+    raise SystemExit(0)
+
+for alarm in alarms:
+    alarm_id = alarm.get("id", "?")
+    name = alarm.get("name", "")
+    active = "ON " if alarm.get("active") else "OFF"
+    kind = alarm.get("kind", "regular")
+
+    if kind == "wake_or_sleep":
+        start = alarm.get("local_time", "?")
+        print(f"[{active}] {name} (ID {alarm_id})")
+        print(f"      begins {start}")
+        print(f"      fade   30m")
+    else:
+        ts = alarm.get("local_time", alarm.get("timestamp", ""))
+        print(f"[{active}] {name} (ID {alarm_id})")
+        print(f"      time   {ts}")
+
+'
+}
+
+alarms_text() {
+    case "$CURRENT_SELECTION" in
+        1)
+            printf '=== %s ===\n' "$DEVICE_1_NAME"
+            format_alarms_from "$BASE_URL_1"
+            ;;
+        2)
+            printf '=== %s ===\n' "$DEVICE_2_NAME"
+            format_alarms_from "$BASE_URL_2"
+            ;;
+        both)
+            printf '=== %s ===\n' "$DEVICE_1_NAME"
+            format_alarms_from "$BASE_URL_1"
+            printf '\n=== %s ===\n' "$DEVICE_2_NAME"
+            format_alarms_from "$BASE_URL_2"
+            ;;
+    esac
+}
+
+
+
+choose_and_toggle_alarm_from() {
+    url="$1"
+    device_name="$2"
+
+    json="$(get_alarms_from "$url")"
+
+    if [ -z "$json" ]; then
+        msg "Could not read alarms for $device_name."
+        return
+    fi
+
+    selection="$(printf '%s\n' "$json" | python3 -c '
+import sys, json
+
+try:
+    alarms = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+
+if not alarms:
+    raise SystemExit(2)
+
+for alarm in alarms:
+    alarm_id = alarm.get("id", "")
+    name = alarm.get("name", "")
+    active = "ON" if alarm.get("active") else "OFF"
+    local_time = alarm.get("local_time", "?")
+    active_raw = "true" if alarm.get("active") else "false"
+    print(f"{alarm_id}|{active_raw}|[{active}] {name} ({local_time})")
+' 2>/dev/null)"
+
+    status=$?
+
+    if [ "$status" -eq 1 ]; then
+        msg "Invalid alarm data for $device_name."
+        return
+    fi
+
+    if [ "$status" -eq 2 ] || [ -z "$selection" ]; then
+        msg "No alarms set on $device_name."
+        return
+    fi
+
+    alarm_ids=()
+    alarm_states=()
+    labels=()
+
+    while IFS='|' read -r alarm_id active label; do
+        alarm_ids+=("$alarm_id")
+        alarm_states+=("$active")
+        labels+=("$label")
+    done <<EOF
+$selection
+EOF
+
+    choice=0
+    run_menu "Toggle Alarm - $device_name" choice "${labels[@]}" "Back" || return
+
+    if [ "$choice" -ge "${#alarm_ids[@]}" ]; then
+        return
+    fi
+
+    alarm_id="${alarm_ids[$choice]}"
+    active="${alarm_states[$choice]}"
+
+    toggle_alarm_from "$url" "$alarm_id" "$active"
+
+    if [ "$active" = "true" ]; then
+        msg "Alarm $alarm_id disabled on $device_name."
+    else
+        msg "Alarm $alarm_id enabled on $device_name."
+    fi
+}
+
+
+
+
+send_power_to() {
+    url="$1"
+    state="$2"
+    curl -s "${url}/power?state=${state}" >/dev/null
+}
+
+send_data_to() {
+    url="$1"
+    data="$2"
+    [ -z "$data" ] && return 1
+    curl -s "${url}/send?data=${data}" >/dev/null
+}
+
+send_power_current() {
+    state="$1"
+
+    case "$CURRENT_SELECTION" in
+        1) send_power_to "$BASE_URL_1" "$state" ;;
+        2) send_power_to "$BASE_URL_2" "$state" ;;
+        both)
+            send_power_to "$BASE_URL_1" "$state"
+            send_power_to "$BASE_URL_2" "$state"
+            ;;
+    esac
+}
+
+send_data_current() {
+    data="$1"
+
+    case "$CURRENT_SELECTION" in
+        1)
+            send_data_to "$BASE_URL_1" "$data"
+            LAST_DATA_1="$data"
+            ;;
+        2)
+            send_data_to "$BASE_URL_2" "$data"
+            LAST_DATA_2="$data"
+            ;;
+        both)
+            send_data_to "$BASE_URL_1" "$data"
+            send_data_to "$BASE_URL_2" "$data"
+            LAST_DATA_1="$data"
+            LAST_DATA_2="$data"
+            ;;
+    esac
+}
+
+STATUS_MSG=""
+
+msg() {
+    STATUS_MSG="$1"
+}
+
+make_white_packet() {
+    bri="$1"
+    tone="$2"
+
+    case "$tone" in
+        energize) suffix="9c00" ;;
+        read)     suffix="5a01" ;;
+        *)        suffix="9c00" ;;
+    esac
+
+    printf '0101010201%02x0302%s' "$bri" "$suffix"
+}
+
+clamp_brightness() {
+    b="$1"
+    [ -z "$b" ] && b=254
+    [ "$b" -lt 1 ] 2>/dev/null && b=1
+    [ "$b" -gt 254 ] 2>/dev/null && b=254
+    printf '%s' "$b"
+}
+
+
+set_hex_brightness() {
+    hex="$1"
+    bri="$2"
+
+    # byte index 5 = chars 11-12 in the hex string
+    prefix=$(printf '%s' "$hex" | cut -c1-10)
+    suffix=$(printf '%s' "$hex" | cut -c13-)
+
+    printf '%s%02x%s' "$prefix" "$bri" "$suffix"
+}
+
+
+percent_to_bri() {
+    pct="$1"
+    [ -z "$pct" ] && pct=100
+    [ "$pct" -lt 1 ] 2>/dev/null && pct=1
+    [ "$pct" -gt 100 ] 2>/dev/null && pct=100
+
+    bri=$(( (pct * 254 + 99) / 100 ))
+    [ "$bri" -lt 1 ] && bri=1
+    [ "$bri" -gt 254 ] && bri=254
+    printf '%s' "$bri"
+}
+
+bri_to_percent() {
+    bri="$1"
+    [ -z "$bri" ] && bri=254
+    pct=$(( (bri * 100 + 127) / 254 ))
+    [ "$pct" -lt 1 ] && pct=1
+    [ "$pct" -gt 100 ] && pct=100
+    printf '%s' "$pct"
+}
+
+hex_brightness() {
+    hex="$1"
+    byte=$(printf '%s' "$hex" | cut -c11-12)
+    printf '%d' "0x$byte"
+}
+
+adjust_brightness_percent() {
+    delta="$1"
+
+    case "$CURRENT_SELECTION" in
+        1)
+            [ -z "$LAST_DATA_1" ] && { msg "No preset/color sent yet for device 1."; return; }
+            cur_bri=$(hex_brightness "$LAST_DATA_1")
+            cur_pct=$(bri_to_percent "$cur_bri")
+            new_pct=$((cur_pct + delta))
+            [ "$new_pct" -lt 1 ] && new_pct=1
+            [ "$new_pct" -gt 100 ] && new_pct=100
+            new_bri=$(percent_to_bri "$new_pct")
+            packet=$(set_hex_brightness "$LAST_DATA_1" "$new_bri")
+            send_data_to "$BASE_URL_1" "$packet"
+            LAST_DATA_1="$packet"
+            #msg "Brightness set to $new_pct%."
+            ;;
+        2)
+            [ -z "$LAST_DATA_2" ] && { msg "No preset/color sent yet for device 2."; return; }
+            cur_bri=$(hex_brightness "$LAST_DATA_2")
+            cur_pct=$(bri_to_percent "$cur_bri")
+            new_pct=$((cur_pct + delta))
+            [ "$new_pct" -lt 1 ] && new_pct=1
+            [ "$new_pct" -gt 100 ] && new_pct=100
+            new_bri=$(percent_to_bri "$new_pct")
+            packet=$(set_hex_brightness "$LAST_DATA_2" "$new_bri")
+            send_data_to "$BASE_URL_2" "$packet"
+            LAST_DATA_2="$packet"
+            #msg "Brightness set to $new_pct%."
+            ;;
+        both)
+            [ -z "$LAST_DATA_1" ] && { msg "No preset/color sent yet for device 1."; return; }
+            [ -z "$LAST_DATA_2" ] && { msg "No preset/color sent yet for device 2."; return; }
+
+            cur_bri_1=$(hex_brightness "$LAST_DATA_1")
+            cur_bri_2=$(hex_brightness "$LAST_DATA_2")
+            cur_pct_1=$(bri_to_percent "$cur_bri_1")
+            cur_pct_2=$(bri_to_percent "$cur_bri_2")
+
+            new_pct_1=$((cur_pct_1 + delta))
+            new_pct_2=$((cur_pct_2 + delta))
+
+            [ "$new_pct_1" -lt 1 ] && new_pct_1=1
+            [ "$new_pct_1" -gt 100 ] && new_pct_1=100
+            [ "$new_pct_2" -lt 1 ] && new_pct_2=1
+            [ "$new_pct_2" -gt 100 ] && new_pct_2=100
+
+            new_bri_1=$(percent_to_bri "$new_pct_1")
+            new_bri_2=$(percent_to_bri "$new_pct_2")
+
+            packet1=$(set_hex_brightness "$LAST_DATA_1" "$new_bri_1")
+            packet2=$(set_hex_brightness "$LAST_DATA_2" "$new_bri_2")
+
+            send_data_to "$BASE_URL_1" "$packet1"
+            send_data_to "$BASE_URL_2" "$packet2"
+
+            LAST_DATA_1="$packet1"
+            LAST_DATA_2="$packet2"
+
+            #msg "Brightness set to $new_pct_1% / $new_pct_2%."
+            ;;
+    esac
+}
+
+
+# -----------------------------
+# Menus
+# -----------------------------
+
+
+
+
+
+draw_menu() {
+    title="$1"
+    selected="$2"
+    shift 2
+
+    clear
+    printf '==============================\n'
+    printf '         %s\n' "$title"
+    printf '==============================\n\n'
+    printf 'Current device: %s\n\n' "$CURRENT_SELECTION"
+    printf 'Live brightness: %s\n\n' "$(live_brightness_text)"
+
+    i=0
+    while [ "$#" -gt 0 ]; do
+        label="$1"
+        shift
+
+        if [ "$i" -eq "$selected" ]; then
+            printf ' > %s\n' "$label"
+        else
+            printf '   %s\n' "$label"
+        fi
+        i=$((i + 1))
+    done
+
+    printf '\n'
+    printf '[↑/↓] move   [Enter] select   [q] back   [+/-] brightness\n'
+
+    if [ -n "$STATUS_MSG" ]; then
+        printf '\n%s\n' "$STATUS_MSG"
+    fi
+}
+
+read_key() {
+    IFS= read -rsn1 key || return 1
+
+    case "$key" in
+        $'\x1b')
+            IFS= read -rsn2 rest || true
+            key="$key$rest"
+            ;;
+    esac
+
+    printf '%s' "$key"
+}
+
+run_menu() {
+    title="$1"
+    var_name="$2"
+    shift 2
+
+    selected=0
+    count=$#
+
+    while true; do
+        draw_menu "$title" "$selected" "$@"
+        key="$(read_key)" || return 1
+
+        case "$key" in
+            $'\x1b[A') # up
+                selected=$((selected - 1))
+                [ "$selected" -lt 0 ] && selected=$((count - 1))
+                ;;
+            $'\x1b[B') # down
+                selected=$((selected + 1))
+                [ "$selected" -ge "$count" ] && selected=0
+                ;;
+            "")
+                eval "$var_name=$selected"
+                return 0
+                ;;
+            q|Q)
+                return 1
+                ;;
+            +)
+                adjust_brightness_percent 5
+                STATUS_MSG="Brightness increased by 5%."
+                ;;
+            -)
+                adjust_brightness_percent -5
+                STATUS_MSG="Brightness decreased by 5%."
+                ;;
+        esac
+    done
+}
+
+
+alarms_menu() {
+    while true; do
+        clear
+        printf '==============================\n'
+        printf '          Alarms\n'
+        printf '==============================\n\n'
+        printf 'Current device: %s\n\n' "$CURRENT_SELECTION"
+
+        alarms_text
+        printf '\n[t] toggle an alarm   [q] back\n'
+
+        if [ -n "$STATUS_MSG" ]; then
+            printf '\n%s\n' "$STATUS_MSG"
+        fi
+
+        key="$(read_key)" || return
+        case "$key" in
+            t|T)
+                case "$CURRENT_SELECTION" in
+                    1)
+                        choose_and_toggle_alarm_from "$BASE_URL_1" "$DEVICE_1_NAME"
+                        ;;
+                    2)
+                        choose_and_toggle_alarm_from "$BASE_URL_2" "$DEVICE_2_NAME"
+                        ;;
+                    both)
+                      device_choice=0
+                      run_menu "Select Device" device_choice \
+                          "$DEVICE_1_NAME" \
+                          "$DEVICE_2_NAME" \
+                          "Back" || continue
+
+                      case "$device_choice" in
+                          0) choose_and_toggle_alarm_from "$BASE_URL_1" "$DEVICE_1_NAME" ;;
+                          1) choose_and_toggle_alarm_from "$BASE_URL_2" "$DEVICE_2_NAME" ;;
+                          *) ;;
+                      esac
+                      ;;
+                                    esac
+                ;;
+            q|Q)
+                return
+                ;;
+        esac
+    done
+}
+
+
+
+
+device_menu() {
+    choice=0
+    run_menu "Devices" choice \
+        "$DEVICE_1_NAME" \
+        "$DEVICE_2_NAME" \
+        "$DEVICE_BOTH_NAME" \
+        "Back" || return
+
+    case "$choice" in
+        0) CURRENT_SELECTION="1";    msg "Now controlling: $DEVICE_1_NAME" ;;
+        1) CURRENT_SELECTION="2";    msg "Now controlling: $DEVICE_2_NAME" ;;
+        2) CURRENT_SELECTION="both"; msg "Now controlling both lights." ;;
+        *) return ;;
+    esac
+}
+
+power_menu() {
+    choice=0
+    run_menu "Power" choice \
+        "Turn ON" \
+        "Turn OFF" \
+        "Back" || return
+
+    case "$choice" in
+        0) send_power_current on;  msg "Light turned ON." ;;
+        1) send_power_current off; msg "Light turned OFF." ;;
+    esac
+}
+
+preset_menu() {
+    choice=0
+    run_menu "Presets" choice \
+        "Energize" \
+        "Read" \
+        "Santorini" \
+        "Amsterdam" \
+        "Coastal Nights" \
+        "Still Waters" \
+        "Arctic Aurora" \
+        "Malibu Pink" \
+        "Ruby Romance" \
+        "Back" || return
+
+    case "$choice" in
+        0) send_data_current "$PRESET_energize";       msg "Preset: Energize" ;;
+        1) send_data_current "$PRESET_read";           msg "Preset: Read" ;;
+        2) send_data_current "$PRESET_santorini";      msg "Preset: Santorini" ;;
+        3) send_data_current "$PRESET_amsterdam";      msg "Preset: Amsterdam" ;;
+        4) send_data_current "$PRESET_coastal_nights"; msg "Preset: Coastal Nights" ;;
+        5) send_data_current "$PRESET_still_waters";   msg "Preset: Still Waters" ;;
+        6) send_data_current "$PRESET_arctic_aurora";  msg "Preset: Arctic Aurora" ;;
+        7) send_data_current "$PRESET_malibu_pink";    msg "Preset: Malibu Pink" ;;
+        8) send_data_current "$PRESET_ruby_romance";   msg "Preset: Ruby Romance" ;;
+    esac
+}
+
+brightness_menu() {
+    while true; do
+        clear
+        cat <<EOF
+==============================
+       Brightness Control
+==============================
+
+Current device: $CURRENT_SELECTION
+
+Use:
+  +   increase by 5%
+  -   decrease by 5%
+  q   back
+
+EOF
+
+        if [ -n "$STATUS_MSG" ]; then
+            printf '%s\n' "$STATUS_MSG"
+        fi
+
+        key="$(read_key)" || return
+
+        case "$key" in
+            +)
+                adjust_brightness_percent 5
+                STATUS_MSG="Brightness increased by 5%."
+                ;;
+            -)
+                adjust_brightness_percent -5
+                STATUS_MSG="Brightness decreased by 5%."
+                ;;
+            q|Q)
+                return
+                ;;
+        esac
+    done
+}
+
+color_menu() {
+    choice=0
+    run_menu "Colors" choice \
+        "Red" \
+        "Green" \
+        "Blue" \
+        "White" \
+        "Back" || return
+
+    case "$choice" in
+        0)
+            [ -n "$COLOR_red" ] && send_data_current "$COLOR_red" && msg "Color: Red" || msg "COLOR_red is empty."
+            ;;
+        1)
+            [ -n "$COLOR_green" ] && send_data_current "$COLOR_green" && msg "Color: Green" || msg "COLOR_green is empty."
+            ;;
+        2)
+            [ -n "$COLOR_blue" ] && send_data_current "$COLOR_blue" && msg "Color: Blue" || msg "COLOR_blue is empty."
+            ;;
+        3)
+            [ -n "$COLOR_white" ] && send_data_current "$COLOR_white" && msg "Color: White" || msg "COLOR_white is empty."
+            ;;
+    esac
+}
+
+main_menu() {
+    while true; do
+        choice=0
+        run_menu "Hue Control" choice \
+            "Power" \
+            "Brightness" \
+            "Alarms" \
+            "Presets" \
+            "Devices" \
+            "Quit" || exit 0
+
+        case "$choice" in
+            0) power_menu ;;
+            1) brightness_menu ;;
+            2) alarms_menu ;;
+            3) preset_menu ;;
+            4) device_menu ;;
+            5) exit 0 ;;
+        esac
+    done
+}
+
+# -----------------------------
+# Start
+# -----------------------------
+
+if ! command -v uvx >/dev/null 2>&1; then
+    echo "uvx is required."
+    exit 1
+fi
+
+if ! start_hue_servers; then
+    echo "Failed to start Hue interactive servers."
+    echo "Check logs: /tmp/hue-tui-1.log and /tmp/hue-tui-2.log"
+    exit 1
+fi
+LAST_DATA_1="$(get_colorhex_from "$BASE_URL_1")"
+LAST_DATA_2="$(get_colorhex_from "$BASE_URL_2")"
+main_menu
