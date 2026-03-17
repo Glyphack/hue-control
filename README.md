@@ -46,8 +46,17 @@ options:
   -h, --help            show this help message and exit
   --debug               Enable debug logging for BLE requests, responses, and
                         validation steps.
-  -d, --device DEVICE   BLE device name. Default is Hue lightstrip plus
+  -d, --device DEVICE   BLE device name. Default is read from
+                        ~/.config/huec.json
   --timeout TIMEOUT     BLE scan timeout.
+
+Config file (~/.config/huec.json) format:
+{
+  "default_device": "Hue lightstrip plus",
+  "device_addresses": {},
+  "device_name": "Hue lightstrip plus",
+  "timeout": 10.0
+}
 ```
 
 ## Development
