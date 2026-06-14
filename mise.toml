@@ -1,0 +1,9 @@
+[tools]
+"github:dmtrKovalenko/blendr" = "latest"
+
+[tasks.release]
+run = '''
+TAG=0.1.7
+git tag -a $TAG -m "$TAG" 
+git push --tags
+'''
